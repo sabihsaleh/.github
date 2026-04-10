@@ -574,6 +574,71 @@ jobs:
             const maxLen = 10000;
             const truncate = (str) => str.length > maxLen ? str.substring(0, maxLen) + '\n... (truncated)' : str;
             const workflowDate = new Date().toISOString().slice(0, 10);
+            const extractPricingRows = (markdown) => markdown
+              .split('\n')
+              .filter(line => line.startsWith('| azurerm_'))
+              .map(line => line.split('|').slice(1, -1).map(part => part.trim()))
+              .filter(parts => parts.length >= 6)
+              .map(([resourceType, meterName, unitPrice, unit, monthlyEstimate, notes]) => ({
+                resourceType,
+                meterName,
+                unitPrice,
+                unit,
+                monthlyEstimate,
+                notes,
+              }));
+
+            const typeToAddress = Object.fromEntries(
+              [...prTerraform.matchAll(/resource\s+"([^"]+)"\s+"([^"]+)"/g)].map(([, type, name]) => [type, `${type}.${name}`])
+            );
+
+            const planActions = Object.fromEntries(
+              [...tfPlan.matchAll(/^#\s+(\S+)\s+will be\s+(.+)$/gm)].map(([, address, actionText]) => {
+                let action = 'Modified';
+                if (actionText.includes('created')) action = 'Added';
+                else if (actionText.includes('destroyed')) action = 'Removed';
+                else if (actionText.includes('read during apply')) action = 'Read';
+                return [address, action];
+              })
+            );
+
+            const buildDeterministicCostSection = (pricingRows) => {
+              if (!pricingRows.length) return '';
+
+              let totalFixed = 0;
+              let hasVariable = false;
+
+              const tableRows = pricingRows.map((row) => {
+                const resourceAddress = typeToAddress[row.resourceType] || row.resourceType;
+                const action = planActions[resourceAddress] || (row.resourceType === 'azurerm_storage_account' ? 'Modified' : 'Added');
+                const numericMonthly = row.monthlyEstimate.match(/^£([\d,.]+)$/);
+                if (numericMonthly) {
+                  totalFixed += parseFloat(numericMonthly[1].replace(/,/g, ''));
+                } else {
+                  hasVariable = true;
+                }
+
+                const notes = row.notes.replace(/\|/g, '/');
+                return `| **${action}** | \`${resourceAddress}\` | ${row.monthlyEstimate} | ${row.meterName} | ${notes} |`;
+              }).join('\n');
+
+              const totalLabel = hasVariable
+                ? `£${totalFixed.toFixed(2)} + variable usage-based charges`
+                : `£${totalFixed.toFixed(2)} (increase)`;
+              const confidence = hasVariable
+                ? 'High (based on live Azure retail pricing, with variable usage-based components called out explicitly)'
+                : 'High (based on live Azure retail pricing rows for the configured region)';
+
+              return [
+                '### 💰 Cost Impact Analysis',
+                '| Change | Resource | Est. Monthly Cost | Azure SKU/Tier | Notes |',
+                '|--------|----------|-------------------|----------------|-------|',
+                tableRows,
+                '',
+                `**Total Estimated Monthly Impact:** ${totalLabel}`,
+                `**Confidence Level:** ${confidence}`,
+              ].join('\n');
+            };
             
             const prompt = `You are an Azure Cost Optimization expert (similar to Azure's AzureCostOptimizeAgent). 
             Analyze the following Terraform changes and Azure data to provide comprehensive cost analysis.
@@ -692,6 +757,11 @@ jobs:
                 .replace(/as of\s+20\d{2}/gi, `as of ${workflowDate}`)
                 .replace(/\*\*Confidence Level:\*\*\s*([^\n]*?)\s*\(based on[^\n)]*20\d{2}[^\n)]*\)/gi, '**Confidence Level:** $1 (based on current workflow data and Azure references)')
                 .replace(/based on Azure pricing for [^\n]*20\d{2}/gi, 'based on current workflow data and Azure references');
+
+              const deterministicCostSection = buildDeterministicCostSection(extractPricingRows(azurePricing));
+              if (deterministicCostSection) {
+                analysis = analysis.replace(/### 💰 Cost Impact Analysis[\s\S]*?(?=\n### )/, `${deterministicCostSection}\n\n`);
+              }
 
               if (azurePricing.trim()) {
                 analysis = `${azurePricing}\n\n---\n\n${analysis}`;

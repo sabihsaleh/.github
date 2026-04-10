@@ -71,8 +71,8 @@ on:
       AZURE_CLIENT_SECRET:
         description: 'Azure Service Principal Client Secret'
         required: true
-      GITHUB_MODELS_TOKEN:
-        description: 'PAT with models:read scope for GitHub Models API (optional, uses GITHUB_TOKEN with models permission if not provided)'
+      MODEL_ACCES:
+        description: 'PAT with models:read scope for GitHub Models API (optional)'
         required: false
 
 permissions:
@@ -322,7 +322,7 @@ jobs:
         id: copilot_analysis
         uses: actions/github-script@v7
         env:
-          MODELS_TOKEN: ${{ secrets.GITHUB_MODELS_TOKEN || secrets.GITHUB_TOKEN }}
+          MODELS_TOKEN: ${{ secrets.MODEL_ACCES || secrets.GITHUB_TOKEN }}
           AI_MODEL: ${{ inputs.ai_model }}
           AZURE_REGION: ${{ inputs.azure_region }}
           COST_THRESHOLD: ${{ inputs.cost_threshold }}

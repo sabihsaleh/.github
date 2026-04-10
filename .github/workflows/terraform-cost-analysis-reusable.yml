@@ -71,12 +71,14 @@ on:
       AZURE_CLIENT_SECRET:
         description: 'Azure Service Principal Client Secret'
         required: true
+      GITHUB_MODELS_TOKEN:
+        description: 'PAT with models:read scope for GitHub Models API (optional)'
+        required: false
 
 permissions:
   contents: read
   pull-requests: write
   id-token: write
-  models: read
 
 jobs:
   analyze:
@@ -320,7 +322,7 @@ jobs:
         id: copilot_analysis
         uses: actions/github-script@v7
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODELS_TOKEN: ${{ secrets.GITHUB_MODELS_TOKEN || secrets.GITHUB_TOKEN }}
           AI_MODEL: ${{ inputs.ai_model }}
           AZURE_REGION: ${{ inputs.azure_region }}
           COST_THRESHOLD: ${{ inputs.cost_threshold }}
@@ -412,7 +414,7 @@ jobs:
               const response = await fetch('https://models.inference.ai.azure.com/chat/completions', {
                 method: 'POST',
                 headers: {
-                  'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`,
+                  'Authorization': `Bearer ${process.env.MODELS_TOKEN}`,
                   'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({

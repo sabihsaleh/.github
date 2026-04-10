@@ -228,8 +228,45 @@ jobs:
             ' "$TF_DIR"/*.tf 2>/dev/null | sort -u
           }
 
+          resource_exists_in_dir() {
+            local dir_path="$1"
+            local resource_type="$2"
+            local resource_name="$3"
+            grep -h -q "^resource \"${resource_type}\" \"${resource_name}\"" "$dir_path"/*.tf 2>/dev/null
+          }
+
+          resource_block_checksum_in_dir() {
+            local dir_path="$1"
+            local resource_type="$2"
+            local resource_name="$3"
+            local block
+            block=$(awk -v resource_type="$resource_type" -v resource_name="$resource_name" '
+              $0 ~ "^resource \"" resource_type "\" \"" resource_name "\"" { in_block = 1; depth = 0 }
+              in_block {
+                print
+                open_count = gsub(/\{/, "&")
+                close_count = gsub(/\}/, "&")
+                depth += open_count - close_count
+                if (depth <= 0) {
+                  exit
+                }
+              }
+            ' "$dir_path"/*.tf 2>/dev/null)
+
+            if [[ -n "$block" ]]; then
+              printf '%s' "$block" | shasum -a 256 | awk '{print $1}'
+            fi
+          }
+
           plan_action() {
             local address="$1"
+            local resource_type="${address%%.*}"
+            local resource_name="${address#*.}"
+            local pr_exists=1
+            local base_exists=1
+            local pr_checksum
+            local base_checksum
+
             if grep -q "^# ${address} will be created" /tmp/terraform-plan.txt 2>/dev/null; then
               echo "Added"
             elif grep -q "^# ${address} will be updated in-place" /tmp/terraform-plan.txt 2>/dev/null; then
@@ -239,6 +276,23 @@ jobs:
             elif grep -q "^# ${address} will be destroyed" /tmp/terraform-plan.txt 2>/dev/null; then
               echo "Removed"
             else
+              resource_exists_in_dir "$TF_DIR" "$resource_type" "$resource_name" || pr_exists=0
+              resource_exists_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" || base_exists=0
+
+              if [[ "$pr_exists" -eq 1 && "$base_exists" -eq 0 ]]; then
+                echo "Added"
+                return
+              fi
+
+              if [[ "$pr_exists" -eq 1 && "$base_exists" -eq 1 ]]; then
+                pr_checksum=$(resource_block_checksum_in_dir "$TF_DIR" "$resource_type" "$resource_name")
+                base_checksum=$(resource_block_checksum_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name")
+                if [[ -n "$pr_checksum" && -n "$base_checksum" && "$pr_checksum" != "$base_checksum" ]]; then
+                  echo "Modified"
+                  return
+                fi
+              fi
+
               echo ""
             fi
           }

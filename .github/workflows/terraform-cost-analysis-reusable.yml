@@ -155,18 +155,21 @@ jobs:
       - name: Get Azure Pricing Info
         if: steps.check_files.outputs.has_tf_files == 'true'
         id: azure_pricing
+        env:
+          ANALYSIS_AZURE_REGION: ${{ inputs.azure_region }}
+          ANALYSIS_TERRAFORM_DIRECTORY: ${{ inputs.terraform_directory }}
         run: |
           echo "## Azure Resource Pricing Reference" > /tmp/azure-pricing.md
           echo "### 💰 Cost Impact Analysis" > /tmp/cost-impact.md
           echo "| Change | Resource | Est. Monthly Cost | Azure SKU/Tier | Notes |" >> /tmp/cost-impact.md
           echo "|--------|----------|-------------------|----------------|-------|" >> /tmp/cost-impact.md
           echo "" >> /tmp/azure-pricing.md
-          echo "Region: ${{ inputs.azure_region }}" >> /tmp/azure-pricing.md
+          echo "Region: $ANALYSIS_AZURE_REGION" >> /tmp/azure-pricing.md
           echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> /tmp/azure-pricing.md
           echo "" >> /tmp/azure-pricing.md
 
           RETAIL_API="https://prices.azure.com/api/retail/prices?api-version=2023-01-01-preview"
-          TF_DIR="${{ inputs.terraform_directory }}"
+          TF_DIR="$ANALYSIS_TERRAFORM_DIRECTORY"
           HOURS_PER_MONTH=730
           DAYS_PER_MONTH=30
           TOTAL_FIXED=0
@@ -293,9 +296,9 @@ jobs:
             storage_replication=$(tf_attr_for_address "$resource_type" "$resource_name" "account_replication_type")
 
             if [[ "$storage_tier" == "Premium" && "$storage_replication" == "LRS" ]]; then
-              storage_json=$(retail_query "serviceName%20eq%20'Storage'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20contains(productName,'Premium%20Block%20Blob')%20and%20contains(skuName,'Premium%20LRS')%20and%20contains(meterName,'Data%20Stored')")
+              storage_json=$(retail_query "serviceName%20eq%20'Storage'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20contains(productName,'Premium%20Block%20Blob')%20and%20contains(skuName,'Premium%20LRS')%20and%20contains(meterName,'Data%20Stored')")
             elif [[ "$storage_tier" == "Standard" && "$storage_replication" == "LRS" ]]; then
-              storage_json=$(retail_query "serviceName%20eq%20'Storage'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20contains(productName,'General%20Block%20Blob%20v2')%20and%20contains(skuName,'Hot%20LRS')%20and%20contains(meterName,'Data%20Stored')")
+              storage_json=$(retail_query "serviceName%20eq%20'Storage'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20contains(productName,'General%20Block%20Blob%20v2')%20and%20contains(skuName,'Hot%20LRS')%20and%20contains(meterName,'Data%20Stored')")
             else
               record_unestimated_resource "$action" "$address" "${storage_tier}_${storage_replication}" "No pricing rule is configured yet for this storage tier and replication combination."
               return
@@ -324,7 +327,7 @@ jobs:
             app_service_sku=$(tf_attr_for_address "$resource_type" "$resource_name" "sku_name")
             app_service_os=$(tf_attr_for_address "$resource_type" "$resource_name" "os_type")
             filter_sku=$(echo "$app_service_sku" | sed 's/\([0-9]\)v\([0-9]\)/\1%20v\2/g')
-            app_json=$(retail_query "serviceName%20eq%20'Azure%20App%20Service'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20contains(skuName,'${filter_sku}')")
+            app_json=$(retail_query "serviceName%20eq%20'Azure%20App%20Service'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20contains(skuName,'${filter_sku}')")
 
             if [[ "$app_service_os" == "Linux" ]]; then
               app_price=$(first_matching_field "$app_json" '.Items[] | select(.type == "Consumption" and (.productName | contains("Linux"))) | .unitPrice')
@@ -353,7 +356,7 @@ jobs:
             local sql_sku sql_json sql_price sql_meter sql_unit sql_monthly
 
             sql_sku=$(tf_attr_for_address "$resource_type" "$resource_name" "sku_name")
-            sql_json=$(retail_query "serviceName%20eq%20'SQL%20Database'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20skuName%20eq%20'${sql_sku}'")
+            sql_json=$(retail_query "serviceName%20eq%20'SQL%20Database'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20skuName%20eq%20'${sql_sku}'")
             sql_price=$(first_matching_field "$sql_json" '.Items[] | select(.type == "Consumption") | .unitPrice')
             sql_meter=$(first_matching_field "$sql_json" '.Items[] | select(.type == "Consumption") | .meterName')
             sql_unit=$(first_matching_field "$sql_json" '.Items[] | select(.type == "Consumption") | .unitOfMeasure')
@@ -377,7 +380,7 @@ jobs:
             redis_sku_name=$(tf_attr_for_address "$resource_type" "$resource_name" "sku_name")
             redis_capacity=$(tf_attr_for_address "$resource_type" "$resource_name" "capacity")
             redis_sku="${redis_sku_name:0:1}${redis_capacity}"
-            redis_json=$(retail_query "serviceName%20eq%20'Redis%20Cache'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20skuName%20eq%20'${redis_sku}'")
+            redis_json=$(retail_query "serviceName%20eq%20'Redis%20Cache'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20skuName%20eq%20'${redis_sku}'")
             redis_price=$(first_matching_field "$redis_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Cache Instance"))) | .unitPrice')
             redis_meter=$(first_matching_field "$redis_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Cache Instance"))) | .meterName')
             redis_unit=$(first_matching_field "$redis_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Cache Instance"))) | .unitOfMeasure')
@@ -404,7 +407,7 @@ jobs:
             local address="$resource_type.$resource_name"
             local ai_json ai_price ai_meter ai_unit ai_monthly
 
-            ai_json=$(retail_query "serviceName%20eq%20'Application%20Insights'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20skuName%20eq%20'Basic'%20and%20contains(meterName,'Data%20Retention')")
+            ai_json=$(retail_query "serviceName%20eq%20'Application%20Insights'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20skuName%20eq%20'Basic'%20and%20contains(meterName,'Data%20Retention')")
             ai_price=$(first_matching_field "$ai_json" '.Items[] | select(.type == "Consumption") | .unitPrice')
             ai_meter=$(first_matching_field "$ai_json" '.Items[] | select(.type == "Consumption") | .meterName')
             ai_unit=$(first_matching_field "$ai_json" '.Items[] | select(.type == "Consumption") | .unitOfMeasure')
@@ -428,7 +431,7 @@ jobs:
             sb_sku=$(tf_attr_for_address "$resource_type" "$resource_name" "sku")
             sb_capacity=$(tf_attr_for_address "$resource_type" "$resource_name" "capacity")
             [[ -z "$sb_capacity" ]] && sb_capacity=1
-            sb_json=$(retail_query "serviceName%20eq%20'Service%20Bus'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20skuName%20eq%20'${sb_sku}'")
+            sb_json=$(retail_query "serviceName%20eq%20'Service%20Bus'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20skuName%20eq%20'${sb_sku}'")
 
             if [[ "$sb_sku" == "Premium" ]]; then
               sb_price=$(first_matching_field "$sb_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Premium Messaging Unit"))) | .unitPrice')
@@ -527,7 +530,7 @@ jobs:
           fi
 
           echo "" >> /tmp/azure-pricing.md
-          RESOURCE_TYPES=$(grep -h "^resource \"azurerm_" "${{ inputs.terraform_directory }}"/*.tf 2>/dev/null | sed 's/resource "\([^"]*\)".*/\1/' | sort -u || true)
+          RESOURCE_TYPES=$(grep -h "^resource \"azurerm_" "$TF_DIR"/*.tf 2>/dev/null | sed 's/resource "\([^"]*\)".*/\1/' | sort -u || true)
           echo "### Resources Found in Terraform:" >> /tmp/azure-pricing.md
           echo "$RESOURCE_TYPES" | while read -r rt; do
             if [ -n "$rt" ]; then

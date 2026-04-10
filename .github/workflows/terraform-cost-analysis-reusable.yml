@@ -72,13 +72,14 @@ on:
         description: 'Azure Service Principal Client Secret'
         required: true
       GITHUB_MODELS_TOKEN:
-        description: 'PAT with models:read scope for GitHub Models API (optional)'
+        description: 'PAT with models:read scope for GitHub Models API (optional, uses GITHUB_TOKEN with models permission if not provided)'
         required: false
 
 permissions:
   contents: read
   pull-requests: write
   id-token: write
+  models: read
 
 jobs:
   analyze:

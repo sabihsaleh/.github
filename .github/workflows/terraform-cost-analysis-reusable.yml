@@ -596,7 +596,7 @@ jobs:
             - For usage-based resources such as storage accounts or Application Insights, do not invent a fixed monthly cost unless the Terraform clearly specifies billable quantity. Use unit pricing and call out the assumption if you provide an example monthly figure.
             - For hourly or daily SKUs with a live retail row, derive the monthly estimate from that live retail row.
             - If LIVE AZURE RETAIL PRICING contains a row for a resource, you MUST use that row's unit price and monthly estimate verbatim in the cost table instead of inventing a different number.
-            - If a LIVE AZURE RETAIL PRICING row shows `Variable` for monthly estimate, keep the table entry as `Variable` and explain the assumption in Notes.
+            - If a LIVE AZURE RETAIL PRICING row shows Variable for monthly estimate, keep the table entry as Variable and explain the assumption in Notes.
 
             ## TERRAFORM PLAN OUTPUT
             ${truncate(tfPlan)}

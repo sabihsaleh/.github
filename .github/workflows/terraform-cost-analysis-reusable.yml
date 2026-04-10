@@ -1,0 +1,517 @@
+# Reusable Terraform Cost Analysis Workflow using Azure Native Tools + GitHub Copilot
+# Uses: Azure CLI, Azure Cost Management, Azure Resource Graph, Azure Advisor
+# NO Infracost required!
+#
+# Usage in other repos:
+#   jobs:
+#     cost-analysis:
+#       uses: YOUR_ORG/.github/.github/workflows/terraform-cost-analysis-reusable.yml@main
+#       with:
+#         terraform_directory: infra
+#       secrets:
+#         AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+#         AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+#         AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+name: Terraform Cost Analysis (Azure Native + Copilot)
+
+on:
+  workflow_call:
+    inputs:
+      terraform_directory:
+        description: 'Path to Terraform directory'
+        required: false
+        type: string
+        default: 'infra'
+      required_tags:
+        description: 'Comma-separated list of required tags'
+        required: false
+        type: string
+        default: 'Environment,Project,Owner,CostCenter,ManagedBy'
+      azure_region:
+        description: 'Azure region for cost estimation reference'
+        required: false
+        type: string
+        default: 'eastus'
+      fail_on_missing_tags:
+        description: 'Fail the workflow if required tags are missing'
+        required: false
+        type: boolean
+        default: false
+      cost_threshold:
+        description: 'Monthly cost threshold in USD (0 = disabled)'
+        required: false
+        type: number
+        default: 0
+      ai_model:
+        description: 'GitHub Models AI model to use'
+        required: false
+        type: string
+        default: 'gpt-4o'
+      run_azure_advisor:
+        description: 'Fetch Azure Advisor cost recommendations'
+        required: false
+        type: boolean
+        default: true
+      check_orphaned_resources:
+        description: 'Check for orphaned/unused resources'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      AZURE_CLIENT_ID:
+        description: 'Azure Service Principal Client ID'
+        required: true
+      AZURE_TENANT_ID:
+        description: 'Azure Tenant ID'
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        description: 'Azure Subscription ID'
+        required: true
+      AZURE_CLIENT_SECRET:
+        description: 'Azure Service Principal Secret (if not using OIDC)'
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write  # Required for OIDC authentication
+  models: read
+
+jobs:
+  analyze:
+    name: Azure Cost Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          path: base
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      # Azure Login using OIDC (preferred) or Service Principal
+      - name: Azure Login (OIDC)
+        if: ${{ secrets.AZURE_CLIENT_SECRET == '' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Azure Login (Service Principal)
+        if: ${{ secrets.AZURE_CLIENT_SECRET != '' }}
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+            }
+
+      - name: Install Azure CLI Extensions
+        run: |
+          az extension add --name costmanagement --yes || true
+          az extension add --name resource-graph --yes || true
+          az extension add --name advisor --yes || true
+
+      - name: Check for Terraform files
+        id: check_files
+        run: |
+          if find "${{ inputs.terraform_directory }}" -name "*.tf" -type f 2>/dev/null | grep -q .; then
+            echo "has_tf_files=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_tf_files=false" >> $GITHUB_OUTPUT
+            echo "::warning::No Terraform files found in ${{ inputs.terraform_directory }}"
+          fi
+
+      - name: Get Changed Files
+        if: steps.check_files.outputs.has_tf_files == 'true'
+        id: changed_files
+        run: |
+          CHANGED_FILES=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }} -- '*.tf' '*.tfvars' | tr '\n' ' ')
+          echo "files=$CHANGED_FILES" >> $GITHUB_OUTPUT
+          git diff origin/${{ github.event.pull_request.base.ref }} -- '*.tf' '*.tfvars' > /tmp/terraform-diff.txt
+
+      - name: Collect Terraform Content
+        if: steps.check_files.outputs.has_tf_files == 'true'
+        run: |
+          echo "=== PR BRANCH TERRAFORM FILES ===" > /tmp/pr-terraform.txt
+          find "${{ inputs.terraform_directory }}" -name "*.tf" -exec echo "--- {} ---" \; -exec cat {} \; >> /tmp/pr-terraform.txt 2>/dev/null || true
+          
+          echo "=== BASE BRANCH TERRAFORM FILES ===" > /tmp/base-terraform.txt
+          find "base/${{ inputs.terraform_directory }}" -name "*.tf" -exec echo "--- {} ---" \; -exec cat {} \; >> /tmp/base-terraform.txt 2>/dev/null || true
+
+      - name: Run Terraform Plan (PR Branch)
+        if: steps.check_files.outputs.has_tf_files == 'true'
+        id: tf_plan
+        run: |
+          cd "${{ inputs.terraform_directory }}"
+          terraform init -backend=false
+          terraform plan -no-color -out=tfplan 2>&1 | tee /tmp/terraform-plan.txt || true
+          terraform show -no-color tfplan > /tmp/terraform-plan-details.txt 2>&1 || true
+        continue-on-error: true
+
+      # Get Azure Pricing for resources in Terraform
+      - name: Get Azure Pricing Info
+        if: steps.check_files.outputs.has_tf_files == 'true'
+        id: azure_pricing
+        run: |
+          echo "## Azure Resource Pricing Reference" > /tmp/azure-pricing.md
+          echo "" >> /tmp/azure-pricing.md
+          echo "Region: ${{ inputs.azure_region }}" >> /tmp/azure-pricing.md
+          echo "" >> /tmp/azure-pricing.md
+          
+          # Extract resource types from Terraform files
+          RESOURCE_TYPES=$(grep -h "^resource \"azurerm_" "${{ inputs.terraform_directory }}"/*.tf 2>/dev/null | \
+                          sed 's/resource "\([^"]*\)".*/\1/' | sort -u || true)
+          
+          echo "### Resources Found in Terraform:" >> /tmp/azure-pricing.md
+          echo "$RESOURCE_TYPES" | while read -r rt; do
+            if [ -n "$rt" ]; then
+              echo "- \`$rt\`" >> /tmp/azure-pricing.md
+            fi
+          done
+          echo "" >> /tmp/azure-pricing.md
+
+      # Get Azure Advisor Cost Recommendations
+      - name: Get Azure Advisor Recommendations
+        if: steps.check_files.outputs.has_tf_files == 'true' && inputs.run_azure_advisor == true
+        id: advisor
+        run: |
+          echo "## Azure Advisor Cost Recommendations" > /tmp/azure-advisor.md
+          echo "" >> /tmp/azure-advisor.md
+          
+          RECOMMENDATIONS=$(az advisor recommendation list \
+            --category Cost \
+            --query "[].{impact:impact, problem:shortDescription.problem, solution:shortDescription.solution, resourceId:resourceMetadata.resourceId}" \
+            --output json 2>/dev/null || echo "[]")
+          
+          if [ "$RECOMMENDATIONS" != "[]" ] && [ -n "$RECOMMENDATIONS" ]; then
+            echo "$RECOMMENDATIONS" | jq -r '.[] | "### \(.impact) Impact\n- **Issue:** \(.problem)\n- **Solution:** \(.solution)\n- **Resource:** `\(.resourceId)`\n"' >> /tmp/azure-advisor.md 2>/dev/null || true
+          else
+            echo "No cost recommendations from Azure Advisor at this time." >> /tmp/azure-advisor.md
+          fi
+        continue-on-error: true
+
+      # Check for Orphaned Resources using Azure Resource Graph
+      - name: Check Orphaned Resources
+        if: steps.check_files.outputs.has_tf_files == 'true' && inputs.check_orphaned_resources == true
+        id: orphaned
+        run: |
+          echo "## Orphaned/Unused Resources Check" > /tmp/orphaned-resources.md
+          echo "" >> /tmp/orphaned-resources.md
+          
+          # Check for unattached disks
+          echo "### Unattached Disks" >> /tmp/orphaned-resources.md
+          UNATTACHED_DISKS=$(az graph query -q "Resources | where type =~ 'microsoft.compute/disks' | where properties.diskState == 'Unattached' | project name, resourceGroup, sku=properties.sku.name, sizeGB=properties.diskSizeGB" --query "data" -o json 2>/dev/null || echo "[]")
+          if [ "$UNATTACHED_DISKS" != "[]" ] && [ -n "$UNATTACHED_DISKS" ]; then
+            echo "$UNATTACHED_DISKS" | jq -r '.[] | "- \(.name) (\(.sizeGB)GB, \(.sku)) in \(.resourceGroup)"' >> /tmp/orphaned-resources.md 2>/dev/null || echo "None found" >> /tmp/orphaned-resources.md
+          else
+            echo "None found" >> /tmp/orphaned-resources.md
+          fi
+          echo "" >> /tmp/orphaned-resources.md
+          
+          # Check for unused public IPs
+          echo "### Unused Public IPs" >> /tmp/orphaned-resources.md
+          UNUSED_IPS=$(az graph query -q "Resources | where type =~ 'microsoft.network/publicipaddresses' | where isnull(properties.ipConfiguration) | project name, resourceGroup, sku=sku.name" --query "data" -o json 2>/dev/null || echo "[]")
+          if [ "$UNUSED_IPS" != "[]" ] && [ -n "$UNUSED_IPS" ]; then
+            echo "$UNUSED_IPS" | jq -r '.[] | "- \(.name) (\(.sku)) in \(.resourceGroup)"' >> /tmp/orphaned-resources.md 2>/dev/null || echo "None found" >> /tmp/orphaned-resources.md
+          else
+            echo "None found" >> /tmp/orphaned-resources.md
+          fi
+          echo "" >> /tmp/orphaned-resources.md
+          
+          # Check for unused NICs
+          echo "### Unused Network Interfaces" >> /tmp/orphaned-resources.md
+          UNUSED_NICS=$(az graph query -q "Resources | where type =~ 'microsoft.network/networkinterfaces' | where isnull(properties.virtualMachine) | project name, resourceGroup" --query "data" -o json 2>/dev/null || echo "[]")
+          if [ "$UNUSED_NICS" != "[]" ] && [ -n "$UNUSED_NICS" ]; then
+            echo "$UNUSED_NICS" | jq -r '.[] | "- \(.name) in \(.resourceGroup)"' >> /tmp/orphaned-resources.md 2>/dev/null || echo "None found" >> /tmp/orphaned-resources.md
+          else
+            echo "None found" >> /tmp/orphaned-resources.md
+          fi
+        continue-on-error: true
+
+      # Get Current Cost Summary (last 30 days)
+      - name: Get Azure Cost Summary
+        if: steps.check_files.outputs.has_tf_files == 'true'
+        id: cost_summary
+        run: |
+          echo "## Current Azure Cost Summary (Last 30 Days)" > /tmp/azure-costs.md
+          echo "" >> /tmp/azure-costs.md
+          
+          # Get cost by service
+          START_DATE=$(date -d "30 days ago" +%Y-%m-%d 2>/dev/null || date -v-30d +%Y-%m-%d)
+          END_DATE=$(date +%Y-%m-%d)
+          
+          COSTS=$(az consumption usage list \
+            --start-date "$START_DATE" \
+            --end-date "$END_DATE" \
+            --query "[].{service:consumedService, cost:pretaxCost}" \
+            --output json 2>/dev/null || echo "[]")
+          
+          if [ "$COSTS" != "[]" ] && [ -n "$COSTS" ] && [ "$COSTS" != "null" ]; then
+            echo "| Service | Cost (USD) |" >> /tmp/azure-costs.md
+            echo "|---------|------------|" >> /tmp/azure-costs.md
+            echo "$COSTS" | jq -r 'group_by(.service) | .[] | {service: .[0].service, total: (map(.cost) | add)} | "| \(.service) | $\(.total | tonumber | . * 100 | round / 100) |"' >> /tmp/azure-costs.md 2>/dev/null || true
+          else
+            echo "Cost data not available or requires additional permissions." >> /tmp/azure-costs.md
+            echo "" >> /tmp/azure-costs.md
+            echo "Ensure the service principal has **Cost Management Reader** role." >> /tmp/azure-costs.md
+          fi
+        continue-on-error: true
+
+      # Validate Resource Tags
+      - name: Validate Resource Tags
+        if: steps.check_files.outputs.has_tf_files == 'true'
+        id: tag_validation
+        run: |
+          TF_DIR="${{ inputs.terraform_directory }}"
+          IFS=',' read -ra REQUIRED_TAGS <<< "${{ inputs.required_tags }}"
+          
+          echo "## Tag Validation Report" > /tmp/tag-validation.md
+          echo "" >> /tmp/tag-validation.md
+          echo "**Required Tags:** ${REQUIRED_TAGS[*]}" >> /tmp/tag-validation.md
+          echo "" >> /tmp/tag-validation.md
+          
+          MISSING_TAGS=0
+          RESOURCES_CHECKED=0
+          
+          for file in $(find "$TF_DIR" -name "*.tf" -type f 2>/dev/null); do
+            while IFS= read -r line; do
+              if [[ -z "$line" ]]; then continue; fi
+              
+              resource_type=$(echo "$line" | sed -n 's/.*resource "\([^"]*\)".*/\1/p')
+              resource_name=$(echo "$line" | sed -n 's/.*resource "[^"]*" "\([^"]*\)".*/\1/p')
+              
+              if [[ -n "$resource_type" && -n "$resource_name" && "$resource_type" == azurerm_* ]]; then
+                ((RESOURCES_CHECKED++))
+                line_num=$(echo "$line" | cut -d: -f1)
+                block_content=$(sed -n "${line_num},$((line_num + 100))p" "$file" 2>/dev/null || true)
+                
+                if ! echo "$block_content" | grep -q "tags\s*="; then
+                  echo "### ❌ \`$resource_type.$resource_name\`" >> /tmp/tag-validation.md
+                  echo "**File:** \`$file\` | **Issue:** No tags block" >> /tmp/tag-validation.md
+                  echo "" >> /tmp/tag-validation.md
+                  MISSING_TAGS=$((MISSING_TAGS + ${#REQUIRED_TAGS[@]}))
+                fi
+              fi
+            done <<< "$(grep -n "^resource \"azurerm_" "$file" 2>/dev/null || true)"
+          done
+          
+          echo "---" >> /tmp/tag-validation.md
+          echo "| Resources Checked | $RESOURCES_CHECKED | Missing Tags | $MISSING_TAGS |" >> /tmp/tag-validation.md
+          
+          if [[ $MISSING_TAGS -eq 0 ]]; then
+            echo "" >> /tmp/tag-validation.md
+            echo "✅ **All resources have tags configured!**" >> /tmp/tag-validation.md
+          fi
+          
+          echo "missing_tags=$MISSING_TAGS" >> $GITHUB_OUTPUT
+          
+          if [[ "${{ inputs.fail_on_missing_tags }}" == "true" && $MISSING_TAGS -gt 0 ]]; then
+            echo "::error::Missing required tags on $MISSING_TAGS resources"
+            exit 1
+          fi
+
+      # Analyze with GitHub Copilot (using Azure data)
+      - name: Analyze with GitHub Copilot
+        if: steps.check_files.outputs.has_tf_files == 'true'
+        id: copilot_analysis
+        uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AI_MODEL: ${{ inputs.ai_model }}
+          AZURE_REGION: ${{ inputs.azure_region }}
+          COST_THRESHOLD: ${{ inputs.cost_threshold }}
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Read all collected data
+            const prTerraform = fs.readFileSync('/tmp/pr-terraform.txt', 'utf8');
+            const baseTerraform = fs.readFileSync('/tmp/base-terraform.txt', 'utf8');
+            const diffContent = fs.readFileSync('/tmp/terraform-diff.txt', 'utf8');
+            const tfPlan = fs.existsSync('/tmp/terraform-plan.txt') ? fs.readFileSync('/tmp/terraform-plan.txt', 'utf8') : 'Plan not available';
+            const tagValidation = fs.readFileSync('/tmp/tag-validation.md', 'utf8');
+            const azureAdvisor = fs.existsSync('/tmp/azure-advisor.md') ? fs.readFileSync('/tmp/azure-advisor.md', 'utf8') : '';
+            const orphanedResources = fs.existsSync('/tmp/orphaned-resources.md') ? fs.readFileSync('/tmp/orphaned-resources.md', 'utf8') : '';
+            const azureCosts = fs.existsSync('/tmp/azure-costs.md') ? fs.readFileSync('/tmp/azure-costs.md', 'utf8') : '';
+            
+            const maxLen = 10000;
+            const truncate = (str) => str.length > maxLen ? str.substring(0, maxLen) + '\n... (truncated)' : str;
+            
+            const prompt = `You are an Azure Cost Optimization expert (similar to Azure's AzureCostOptimizeAgent). 
+            Analyze the following Terraform changes and Azure data to provide comprehensive cost analysis.
+
+            ## YOUR MISSION
+            1. **Estimate Cost Impact**: Calculate monthly cost changes based on Azure pricing for ${process.env.AZURE_REGION} region
+            2. **Identify Savings Opportunities**: Using Azure Advisor data and orphaned resources
+            3. **Tag Compliance**: Review tag validation
+            4. **Security & Best Practices**: Identify issues
+            5. **Actionable Recommendations**: Provide specific commands or changes
+
+            ## TERRAFORM PLAN OUTPUT
+            ${truncate(tfPlan)}
+
+            ## TERRAFORM DIFF
+            ${truncate(diffContent)}
+
+            ## BASE TERRAFORM (Before)
+            ${truncate(baseTerraform)}
+
+            ## PR TERRAFORM (After)
+            ${truncate(prTerraform)}
+
+            ## AZURE ADVISOR RECOMMENDATIONS
+            ${truncate(azureAdvisor)}
+
+            ## ORPHANED RESOURCES
+            ${truncate(orphanedResources)}
+
+            ## CURRENT AZURE COSTS
+            ${truncate(azureCosts)}
+
+            ## TAG VALIDATION
+            ${truncate(tagValidation)}
+
+            ## OUTPUT FORMAT (use exactly this markdown structure)
+
+            ### 💰 Cost Impact Analysis
+            | Change | Resource | Est. Monthly Cost | Azure SKU/Tier | Notes |
+            |--------|----------|-------------------|----------------|-------|
+            | Added/Modified/Removed | resource_name | $X.XX | SKU details | explanation |
+
+            **Total Estimated Monthly Impact:** $X.XX (increase/decrease)
+            **Confidence Level:** High/Medium/Low (based on available data)
+
+            ### 📦 Resource Changes Summary
+            - **Added:** resources with SKU details
+            - **Modified:** resources and what changed
+            - **Removed:** resources
+
+            ### 💡 Cost Optimization Recommendations
+            Based on Azure best practices and the analysis:
+            1. [Specific recommendation with savings estimate and Azure CLI command if applicable]
+            2. [Reserved Instance recommendations if applicable]
+            3. [Right-sizing recommendations]
+            4. [Orphaned resource cleanup]
+
+            ### 🏷️ Tag Compliance
+            [Summary with specific missing tags]
+
+            ### 🔐 Security & Best Practices
+            [Azure Well-Architected Framework alignment]
+
+            ### ⚡ Quick Wins
+            [Immediate actions that can save money with minimal risk]
+
+            Use accurate Azure pricing for ${process.env.AZURE_REGION} region. Reference specific Azure SKUs and tiers.`;
+
+            try {
+              const response = await fetch('https://models.github.com/chat/completions', {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  model: process.env.AI_MODEL,
+                  messages: [
+                    { 
+                      role: 'system', 
+                      content: 'You are an Azure Cost Optimization Agent with deep expertise in Azure pricing, SKUs, Reserved Instances, and the Azure Well-Architected Framework. You provide accurate cost estimates based on current Azure pricing and actionable recommendations.' 
+                    },
+                    { role: 'user', content: prompt }
+                  ],
+                  max_tokens: 4000,
+                  temperature: 0.2
+                })
+              });
+              
+              if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`GitHub Models API: ${response.status} - ${errorText}`);
+              }
+              
+              const data = await response.json();
+              const analysis = data.choices[0].message.content;
+              fs.writeFileSync('/tmp/copilot-analysis.md', analysis);
+              
+              // Check cost threshold
+              const threshold = parseFloat(process.env.COST_THRESHOLD);
+              if (threshold > 0) {
+                const costMatch = analysis.match(/Total Estimated Monthly Impact:\s*\+?\$?([\d,]+\.?\d*)/i);
+                if (costMatch) {
+                  const estimatedCost = parseFloat(costMatch[1].replace(',', ''));
+                  if (estimatedCost > threshold) {
+                    core.warning(`Estimated monthly cost increase ($${estimatedCost}) exceeds threshold ($${threshold})`);
+                  }
+                }
+              }
+              
+            } catch (error) {
+              console.error('Error:', error);
+              const fallback = `### ⚠️ AI Analysis Unavailable\n\n${error.message}\n\n${tagValidation}\n\n${azureAdvisor}\n\n${orphanedResources}`;
+              fs.writeFileSync('/tmp/copilot-analysis.md', fallback);
+            }
+
+      # Post PR Comment
+      - name: Post Analysis Comment
+        if: steps.check_files.outputs.has_tf_files == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const analysis = fs.readFileSync('/tmp/copilot-analysis.md', 'utf8');
+            
+            const body = `## 🤖 Azure Cost Analysis by GitHub Copilot
+
+            ${analysis}
+
+            ---
+            <sub>📊 **Analysis Details:** TF Directory: \`${{ inputs.terraform_directory }}\` | Region: \`${{ inputs.azure_region }}\` | Model: \`${{ inputs.ai_model }}\`</sub>
+            <sub>🔧 **Data Sources:** Azure Resource Graph, Azure Advisor, Azure Cost Management, Terraform Plan</sub>`;
+            
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const botComment = comments.find(c => 
+              c.user.type === 'Bot' && c.body.includes('Azure Cost Analysis by GitHub Copilot')
+            );
+            
+            const commentParams = {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            };
+            
+            if (botComment) {
+              await github.rest.issues.updateComment({ ...commentParams, comment_id: botComment.id });
+            } else {
+              await github.rest.issues.createComment({ ...commentParams, issue_number: context.issue.number });
+            }
+
+      - name: Azure Logout
+        if: always()
+        run: az logout || true
+        continue-on-error: true
+
+      - name: Skip - No Terraform Files
+        if: steps.check_files.outputs.has_tf_files == 'false'
+        run: echo "No Terraform files found in ${{ inputs.terraform_directory }}. Skipping analysis."

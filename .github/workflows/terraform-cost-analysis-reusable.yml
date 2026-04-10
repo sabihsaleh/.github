@@ -158,6 +158,9 @@ jobs:
         id: azure_pricing
         run: |
           echo "## Azure Resource Pricing Reference" > /tmp/azure-pricing.md
+          echo "### 💰 Cost Impact Analysis" > /tmp/cost-impact.md
+          echo "| Change | Resource | Est. Monthly Cost | Azure SKU/Tier | Notes |" >> /tmp/cost-impact.md
+          echo "|--------|----------|-------------------|----------------|-------|" >> /tmp/cost-impact.md
           echo "" >> /tmp/azure-pricing.md
           echo "Region: ${{ inputs.azure_region }}" >> /tmp/azure-pricing.md
           echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> /tmp/azure-pricing.md
@@ -167,6 +170,8 @@ jobs:
           TF_DIR="${{ inputs.terraform_directory }}"
           HOURS_PER_MONTH=730
           DAYS_PER_MONTH=30
+          TOTAL_FIXED=0
+          HAS_VARIABLE=0
 
           tf_attr() {
             local resource_type="$1"
@@ -191,6 +196,34 @@ jobs:
             ' "$TF_DIR"/*.tf 2>/dev/null | head -1
           }
 
+          tf_resource_address() {
+            local resource_type="$1"
+            awk -v resource_type="$resource_type" '
+              $0 ~ "^resource \"" resource_type "\" \"" {
+                match($0, /^resource \"[^\"]+\" \"([^\"]+)\"/, matches)
+                if (matches[1] != "") {
+                  print resource_type "." matches[1]
+                  exit
+                }
+              }
+            ' "$TF_DIR"/*.tf 2>/dev/null | head -1
+          }
+
+          plan_action() {
+            local address="$1"
+            if grep -q "^# ${address} will be created" /tmp/terraform-plan.txt 2>/dev/null; then
+              echo "Added"
+            elif grep -q "^# ${address} will be updated in-place" /tmp/terraform-plan.txt 2>/dev/null; then
+              echo "Modified"
+            elif grep -q "^# ${address} must be replaced" /tmp/terraform-plan.txt 2>/dev/null; then
+              echo "Modified"
+            elif grep -q "^# ${address} will be destroyed" /tmp/terraform-plan.txt 2>/dev/null; then
+              echo "Removed"
+            else
+              echo "Added"
+            fi
+          }
+
           append_price_row() {
             local resource_label="$1"
             local source_label="$2"
@@ -199,6 +232,20 @@ jobs:
             local monthly_estimate="$5"
             local notes="$6"
             echo "| $resource_label | $source_label | $price | $unit | $monthly_estimate | $notes |" >> /tmp/azure-pricing.md
+          }
+
+          append_cost_row() {
+            local action="$1"
+            local address="$2"
+            local monthly_estimate="$3"
+            local tier="$4"
+            local notes="$5"
+            echo "| **$action** | \`$address\` | $monthly_estimate | $tier | $notes |" >> /tmp/cost-impact.md
+            if [[ "$monthly_estimate" =~ ^£([0-9]+\.?[0-9]*)$ ]]; then
+              TOTAL_FIXED=$(awk -v a="$TOTAL_FIXED" -v b="${BASH_REMATCH[1]}" 'BEGIN { printf "%.2f", a + b }')
+            else
+              HAS_VARIABLE=1
+            fi
           }
 
           retail_query() {
@@ -220,6 +267,8 @@ jobs:
             if [[ -n "$storage_price" && "$storage_price" != "null" ]]; then
               storage_example=$(awk -v p="$storage_price" 'BEGIN { printf "£%.2f", p * 756 }')
               append_price_row "azurerm_storage_account" "$storage_meter" "£$storage_price" "$storage_unit" "Variable" "Usage-based. No exact monthly total without stored volume. Example: 756 GB-month is approximately $storage_example."
+              storage_address=$(tf_resource_address "azurerm_storage_account")
+              append_cost_row "$(plan_action "$storage_address")" "$storage_address" "Variable" "Premium LRS" "Live Azure retail unit price is £$storage_price per GB/Month. Example only: 756 GB-month is approximately $storage_example."
             fi
           fi
 
@@ -240,7 +289,19 @@ jobs:
             if [[ -n "$app_price" && "$app_price" != "null" ]]; then
               app_monthly=$(awk -v p="$app_price" -v h="$HOURS_PER_MONTH" 'BEGIN { printf "£%.2f", p * h }')
               append_price_row "azurerm_service_plan" "$app_meter" "£$app_price" "$app_unit" "$app_monthly" "Live retail price for ${app_service_os:-default} App Service SKU ${app_service_sku}."
+              app_address=$(tf_resource_address "azurerm_service_plan")
+              append_cost_row "$(plan_action "$app_address")" "$app_address" "$app_monthly" "$app_service_sku" "Live Azure retail price from meter $app_meter at £$app_price per hour."
             fi
+          fi
+
+          web_app_address=$(tf_resource_address "azurerm_linux_web_app")
+          if [[ -n "$web_app_address" ]]; then
+            append_cost_row "$(plan_action "$web_app_address")" "$web_app_address" "£0.00" "Included in App Service Plan" "The web app itself does not add a separate base compute charge beyond the plan."
+          fi
+
+          sql_server_address=$(tf_resource_address "azurerm_mssql_server")
+          if [[ -n "$sql_server_address" ]]; then
+            append_cost_row "$(plan_action "$sql_server_address")" "$sql_server_address" "£0.00" "Included in SQL Database pricing" "The logical SQL server has no standalone base charge in this estimate."
           fi
 
           sql_sku=$(tf_attr "azurerm_mssql_database" "sku_name")
@@ -252,6 +313,8 @@ jobs:
             if [[ -n "$sql_price" && "$sql_price" != "null" ]]; then
               sql_monthly=$(awk -v p="$sql_price" -v d="$DAYS_PER_MONTH" 'BEGIN { printf "£%.2f", p * d }')
               append_price_row "azurerm_mssql_database" "$sql_meter" "£$sql_price" "$sql_unit" "$sql_monthly" "Live retail price for SQL Database SKU ${sql_sku}."
+              sql_address=$(tf_resource_address "azurerm_mssql_database")
+              append_cost_row "$(plan_action "$sql_address")" "$sql_address" "$sql_monthly" "$sql_sku" "Live Azure retail price from meter $sql_meter at £$sql_price per day."
             fi
           fi
 
@@ -266,7 +329,23 @@ jobs:
             if [[ -n "$redis_price" && "$redis_price" != "null" ]]; then
               redis_monthly=$(awk -v p="$redis_price" -v h="$HOURS_PER_MONTH" 'BEGIN { printf "£%.2f", p * h }')
               append_price_row "azurerm_redis_cache" "$redis_meter" "£$redis_price" "$redis_unit" "$redis_monthly" "Live retail price for Redis ${redis_sku_name} ${redis_sku}."
+              redis_address=$(tf_resource_address "azurerm_redis_cache")
+              append_cost_row "$(plan_action "$redis_address")" "$redis_address" "$redis_monthly" "${redis_sku_name}_${redis_sku}" "Live Azure retail price from meter $redis_meter at £$redis_price per hour."
             fi
+          fi
+
+          insights_address=$(tf_resource_address "azurerm_application_insights")
+          if [[ -n "$insights_address" ]]; then
+            append_cost_row "$(plan_action "$insights_address")" "$insights_address" "Variable" "Application Insights" "Usage-based service. The retail API does not expose a single fixed monthly base cost for this Terraform definition."
+          fi
+
+          echo "" >> /tmp/cost-impact.md
+          if [[ "$HAS_VARIABLE" -eq 1 ]]; then
+            echo "**Total Estimated Monthly Impact:** £${TOTAL_FIXED} + variable usage-based charges" >> /tmp/cost-impact.md
+            echo "**Confidence Level:** High (derived from live Azure retail pricing, with usage-based resources called out explicitly)" >> /tmp/cost-impact.md
+          else
+            echo "**Total Estimated Monthly Impact:** £${TOTAL_FIXED} (increase)" >> /tmp/cost-impact.md
+            echo "**Confidence Level:** High (derived from live Azure retail pricing for the configured region)" >> /tmp/cost-impact.md
           fi
 
           echo "" >> /tmp/azure-pricing.md
@@ -567,6 +646,7 @@ jobs:
             const tfPlan = fs.existsSync('/tmp/terraform-plan.txt') ? fs.readFileSync('/tmp/terraform-plan.txt', 'utf8') : 'Plan not available';
             const tagValidation = fs.readFileSync('/tmp/tag-validation.md', 'utf8');
             const azurePricing = fs.existsSync('/tmp/azure-pricing.md') ? fs.readFileSync('/tmp/azure-pricing.md', 'utf8') : '';
+            const costImpact = fs.existsSync('/tmp/cost-impact.md') ? fs.readFileSync('/tmp/cost-impact.md', 'utf8') : '';
             const azureAdvisor = fs.existsSync('/tmp/azure-advisor.md') ? fs.readFileSync('/tmp/azure-advisor.md', 'utf8') : '';
             const orphanedResources = fs.existsSync('/tmp/orphaned-resources.md') ? fs.readFileSync('/tmp/orphaned-resources.md', 'utf8') : '';
             const azureCosts = fs.existsSync('/tmp/azure-costs.md') ? fs.readFileSync('/tmp/azure-costs.md', 'utf8') : '';
@@ -758,7 +838,7 @@ jobs:
                 .replace(/\*\*Confidence Level:\*\*\s*([^\n]*?)\s*\(based on[^\n)]*20\d{2}[^\n)]*\)/gi, '**Confidence Level:** $1 (based on current workflow data and Azure references)')
                 .replace(/based on Azure pricing for [^\n]*20\d{2}/gi, 'based on current workflow data and Azure references');
 
-              const deterministicCostSection = buildDeterministicCostSection(extractPricingRows(azurePricing));
+              const deterministicCostSection = costImpact.trim() || buildDeterministicCostSection(extractPricingRows(azurePricing));
               if (deterministicCostSection) {
                 analysis = analysis.replace(/### 💰 Cost Impact Analysis[\s\S]*?(?=\n### )/, `${deterministicCostSection}\n\n`);
               }
@@ -796,9 +876,13 @@ jobs:
           script: |
             const fs = require('fs');
             const analysis = fs.readFileSync('/tmp/copilot-analysis.md', 'utf8');
+            const costImpact = fs.existsSync('/tmp/cost-impact.md') ? fs.readFileSync('/tmp/cost-impact.md', 'utf8') : '';
+            const analysisWithoutCostSection = analysis.replace(/### 💰 Cost Impact Analysis[\s\S]*?(?=\n### |$)/, '').trim();
             const body = `## 🤖 Azure Cost Analysis by GitHub Copilot
 
-            ${analysis}
+            ${costImpact ? `${costImpact}
+
+            ` : ''}${analysisWithoutCostSection}
 
             ---
             <sub>📊 **Analysis Details:** TF Directory: \`${{ inputs.terraform_directory }}\` | Region: \`${{ inputs.azure_region }}\` | Model: \`${{ inputs.ai_model }}\`</sub>

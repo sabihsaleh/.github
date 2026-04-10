@@ -408,7 +408,7 @@ jobs:
             Use accurate Azure pricing for ${process.env.AZURE_REGION} region. Reference specific Azure SKUs and tiers.`;
 
             try {
-              const response = await fetch('https://models.github.com/chat/completions', {
+              const response = await fetch('https://models.inference.ai.azure.com/chat/completions', {
                 method: 'POST',
                 headers: {
                   'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`,

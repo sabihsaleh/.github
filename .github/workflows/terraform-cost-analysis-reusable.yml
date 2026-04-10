@@ -261,7 +261,9 @@ jobs:
       - name: Validate Resource Tags
         if: steps.check_files.outputs.has_tf_files == 'true'
         id: tag_validation
+        shell: bash
         run: |
+          set +e  # Disable exit on error for this script
           TF_DIR="${{ inputs.terraform_directory }}"
           IFS=',' read -ra REQUIRED_TAGS <<< "${{ inputs.required_tags }}"
           
@@ -281,7 +283,7 @@ jobs:
               resource_name=$(echo "$line" | sed -n 's/.*resource "[^"]*" "\([^"]*\)".*/\1/p')
               
               if [[ -n "$resource_type" && -n "$resource_name" && "$resource_type" == azurerm_* ]]; then
-                ((RESOURCES_CHECKED++))
+                RESOURCES_CHECKED=$((RESOURCES_CHECKED + 1))
                 line_num=$(echo "$line" | cut -d: -f1)
                 block_content=$(sed -n "${line_num},$((line_num + 100))p" "$file" 2>/dev/null || true)
                 
@@ -309,6 +311,7 @@ jobs:
             echo "::error::Missing required tags on $MISSING_TAGS resources"
             exit 1
           fi
+          exit 0
 
       # Analyze with GitHub Copilot (using Azure data)
       - name: Analyze with GitHub Copilot

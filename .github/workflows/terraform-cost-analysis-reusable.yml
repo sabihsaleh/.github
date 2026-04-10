@@ -180,6 +180,7 @@ jobs:
           STORAGE_ASSUMED_GB_MONTH=756
           APP_INSIGHTS_ASSUMED_GB_MONTH=30
           SERVICE_BUS_BASIC_ASSUMED_OPERATIONS_MILLIONS=5
+          APIM_CONSUMPTION_ASSUMED_10K_CALLS=100
 
           tf_attr_in_dir() {
             local dir_path="$1"
@@ -590,6 +591,73 @@ jobs:
             fi
           }
 
+          record_api_management() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local action="$3"
+            local address="$resource_type.$resource_name"
+            local apim_sku_name apim_tier apim_capacity retail_sku apim_json apim_price apim_meter apim_unit apim_monthly old_apim_sku_name old_apim_tier old_apim_capacity old_retail_sku old_apim_json old_apim_price old_apim_monthly
+
+            apim_sku_name=$(tf_attr_for_address "$resource_type" "$resource_name" "sku_name")
+            apim_tier=${apim_sku_name%_*}
+            apim_capacity=${apim_sku_name#*_}
+            [[ "$apim_capacity" == "$apim_sku_name" ]] && apim_capacity=1
+
+            case "$apim_tier" in
+              BasicV2) retail_sku="Basic v2" ;;
+              StandardV2) retail_sku="Standard v2" ;;
+              PremiumV2) retail_sku="Premium v2" ;;
+              *) retail_sku="$apim_tier" ;;
+            esac
+
+            apim_json=$(retail_query "serviceName%20eq%20'API%20Management'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20skuName%20eq%20'${retail_sku}'")
+
+            if [[ "$apim_tier" == "Consumption" ]]; then
+              apim_price=$(first_matching_field "$apim_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Calls"))) | .unitPrice')
+              apim_meter=$(first_matching_field "$apim_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Calls"))) | .meterName')
+              apim_unit=$(first_matching_field "$apim_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Calls"))) | .unitOfMeasure')
+              if [[ -n "$apim_price" && "$apim_price" != "null" ]]; then
+                apim_monthly=$(awk -v p="$apim_price" -v units="$APIM_CONSUMPTION_ASSUMED_10K_CALLS" 'BEGIN { printf "£%.2f", p * units }')
+                append_price_row "$resource_type" "$apim_meter" "£$apim_price" "$apim_unit" "$apim_monthly" "Assumes ${APIM_CONSUMPTION_ASSUMED_10K_CALLS} units of 10K API calls per month."
+                add_estimate_with_optional_delta "$action" "$address" "${apim_monthly#£}" "$old_apim_monthly" "$apim_sku_name" "Assumes ${APIM_CONSUMPTION_ASSUMED_10K_CALLS} units of 10K API calls per month at £$apim_price per unit from Azure Retail Prices."
+              else
+                record_unestimated_resource "$action" "$address" "$apim_sku_name" "Retail pricing query did not return a usable API Management consumption price row."
+              fi
+              return
+            fi
+
+            apim_price=$(first_matching_field "$apim_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Unit")) and (.meterName | contains("Secondary") | not)) | .unitPrice')
+            apim_meter=$(first_matching_field "$apim_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Unit")) and (.meterName | contains("Secondary") | not)) | .meterName')
+            apim_unit=$(first_matching_field "$apim_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Unit")) and (.meterName | contains("Secondary") | not)) | .unitOfMeasure')
+
+            if [[ -n "$apim_price" && "$apim_price" != "null" ]]; then
+              apim_monthly=$(awk -v p="$apim_price" -v h="$HOURS_PER_MONTH" -v c="$apim_capacity" 'BEGIN { printf "£%.2f", p * h * c }')
+              append_price_row "$resource_type" "$apim_meter" "£$apim_price" "$apim_unit" "$apim_monthly" "Monthly estimate is calculated as £$apim_price x ${HOURS_PER_MONTH} hours x ${apim_capacity} unit(s)."
+
+              if [[ "$action" == "Modified" ]]; then
+                old_apim_sku_name=$(tf_attr_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" "sku_name")
+                old_apim_tier=${old_apim_sku_name%_*}
+                old_apim_capacity=${old_apim_sku_name#*_}
+                [[ "$old_apim_capacity" == "$old_apim_sku_name" ]] && old_apim_capacity=1
+                case "$old_apim_tier" in
+                  BasicV2) old_retail_sku="Basic v2" ;;
+                  StandardV2) old_retail_sku="Standard v2" ;;
+                  PremiumV2) old_retail_sku="Premium v2" ;;
+                  *) old_retail_sku="$old_apim_tier" ;;
+                esac
+                old_apim_json=$(retail_query "serviceName%20eq%20'API%20Management'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20skuName%20eq%20'${old_retail_sku}'")
+                old_apim_price=$(first_matching_field "$old_apim_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Unit")) and (.meterName | contains("Secondary") | not)) | .unitPrice')
+                if [[ -n "$old_apim_price" && "$old_apim_price" != "null" ]]; then
+                  old_apim_monthly=$(awk -v p="$old_apim_price" -v h="$HOURS_PER_MONTH" -v c="$old_apim_capacity" 'BEGIN { printf "%.2f", p * h * c }')
+                fi
+              fi
+
+              add_estimate_with_optional_delta "$action" "$address" "${apim_monthly#£}" "$old_apim_monthly" "$apim_sku_name" "Live Azure retail price from meter $apim_meter at £$apim_price per hour with ${apim_capacity} unit(s)."
+            else
+              record_unestimated_resource "$action" "$address" "$apim_sku_name" "Retail pricing query did not return a usable API Management unit price row."
+            fi
+          }
+
           echo "### Live Retail Prices" >> /tmp/azure-pricing.md
           echo "| Resource | Azure Retail Meter | Unit Price | Unit | Monthly Estimate | Notes |" >> /tmp/azure-pricing.md
           echo "|----------|--------------------|------------|------|------------------|-------|" >> /tmp/azure-pricing.md
@@ -621,6 +689,9 @@ jobs:
                 ;;
               azurerm_application_insights)
                 record_application_insights "$resource_type" "$resource_name" "$action"
+                ;;
+              azurerm_api_management)
+                record_api_management "$resource_type" "$resource_name" "$action"
                 ;;
               azurerm_servicebus_namespace)
                 record_service_bus_namespace "$resource_type" "$resource_name" "$action"

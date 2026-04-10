@@ -595,6 +595,8 @@ jobs:
             - If exact live retail pricing cannot be proven from the supplied Azure data, say the estimate is based on current workflow data and set confidence to Medium instead of citing an old year.
             - For usage-based resources such as storage accounts or Application Insights, do not invent a fixed monthly cost unless the Terraform clearly specifies billable quantity. Use unit pricing and call out the assumption if you provide an example monthly figure.
             - For hourly or daily SKUs with a live retail row, derive the monthly estimate from that live retail row.
+            - If LIVE AZURE RETAIL PRICING contains a row for a resource, you MUST use that row's unit price and monthly estimate verbatim in the cost table instead of inventing a different number.
+            - If a LIVE AZURE RETAIL PRICING row shows `Variable` for monthly estimate, keep the table entry as `Variable` and explain the assumption in Notes.
 
             ## TERRAFORM PLAN OUTPUT
             ${truncate(tfPlan)}
@@ -719,8 +721,15 @@ jobs:
           script: |
             const fs = require('fs');
             const analysis = fs.readFileSync('/tmp/copilot-analysis.md', 'utf8');
+            const azurePricing = fs.existsSync('/tmp/azure-pricing.md') ? fs.readFileSync('/tmp/azure-pricing.md', 'utf8') : '';
             
             const body = `## 🤖 Azure Cost Analysis by GitHub Copilot
+
+            ${azurePricing ? `${azurePricing}
+
+            ---
+
+            ` : ''}
 
             ${analysis}
 

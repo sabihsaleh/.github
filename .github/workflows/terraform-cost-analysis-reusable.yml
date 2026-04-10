@@ -693,6 +693,10 @@ jobs:
                 .replace(/\*\*Confidence Level:\*\*\s*([^\n]*?)\s*\(based on[^\n)]*20\d{2}[^\n)]*\)/gi, '**Confidence Level:** $1 (based on current workflow data and Azure references)')
                 .replace(/based on Azure pricing for [^\n]*20\d{2}/gi, 'based on current workflow data and Azure references');
 
+              if (azurePricing.trim()) {
+                analysis = `${azurePricing}\n\n---\n\n${analysis}`;
+              }
+
               fs.writeFileSync('/tmp/copilot-analysis.md', analysis);
               
               // Check cost threshold
@@ -709,7 +713,8 @@ jobs:
               
             } catch (error) {
               console.error('Error:', error);
-              const fallback = `### ⚠️ AI Analysis Unavailable\n\n${error.message}\n\n${tagValidation}\n\n${azureAdvisor}\n\n${orphanedResources}`;
+              const pricingPrefix = azurePricing.trim() ? `${azurePricing}\n\n---\n\n` : '';
+              const fallback = `${pricingPrefix}### ⚠️ AI Analysis Unavailable\n\n${error.message}\n\n${tagValidation}\n\n${azureAdvisor}\n\n${orphanedResources}`;
               fs.writeFileSync('/tmp/copilot-analysis.md', fallback);
             }
 
@@ -721,15 +726,7 @@ jobs:
           script: |
             const fs = require('fs');
             const analysis = fs.readFileSync('/tmp/copilot-analysis.md', 'utf8');
-            const azurePricing = fs.existsSync('/tmp/azure-pricing.md') ? fs.readFileSync('/tmp/azure-pricing.md', 'utf8') : '';
-            
             const body = `## 🤖 Azure Cost Analysis by GitHub Copilot
-
-            ${azurePricing ? `${azurePricing}
-
-            ---
-
-            ` : ''}
 
             ${analysis}
 

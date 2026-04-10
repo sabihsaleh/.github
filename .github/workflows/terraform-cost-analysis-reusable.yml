@@ -179,8 +179,13 @@ jobs:
           HAS_GAPS=0
           STORAGE_ASSUMED_GB_MONTH=756
           APP_INSIGHTS_ASSUMED_GB_MONTH=30
+          LOG_ANALYTICS_ASSUMED_GB_MONTH=30
+          CONTAINER_REGISTRY_ASSUMED_GB_MONTH=50
           SERVICE_BUS_BASIC_ASSUMED_OPERATIONS_MILLIONS=5
           APIM_CONSUMPTION_ASSUMED_10K_CALLS=100
+          GENERIC_STORAGE_ASSUMED_GB_MONTH=50
+          GENERIC_10K_UNITS_ASSUMED_PER_MONTH=100
+          COSMOS_ASSUMED_RU_PER_SEC=400
 
           tf_attr_in_dir() {
             local dir_path="$1"
@@ -712,6 +717,275 @@ jobs:
             fi
           }
 
+          record_cosmos_throughput_resource() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local action="$3"
+            local address="$resource_type.$resource_name"
+            local throughput autoscale_throughput ru_units cosmos_json cosmos_price cosmos_meter cosmos_unit cosmos_monthly old_throughput old_autoscale_throughput old_ru_units old_cosmos_monthly assumption_note
+
+            throughput=$(tf_attr_for_address "$resource_type" "$resource_name" "throughput")
+            autoscale_throughput=$(tf_attr_for_address "$resource_type" "$resource_name" "max_throughput")
+
+            if [[ -n "$autoscale_throughput" ]]; then
+              ru_units=$(awk -v t="$autoscale_throughput" 'BEGIN { printf "%.2f", t / 100 }')
+              assumption_note="Uses autoscale max throughput of ${autoscale_throughput} RU/s."
+            elif [[ -n "$throughput" ]]; then
+              ru_units=$(awk -v t="$throughput" 'BEGIN { printf "%.2f", t / 100 }')
+              assumption_note="Uses provisioned throughput of ${throughput} RU/s."
+            else
+              ru_units=$(awk -v t="$COSMOS_ASSUMED_RU_PER_SEC" 'BEGIN { printf "%.2f", t / 100 }')
+              assumption_note="No throughput was declared, so the estimate assumes ${COSMOS_ASSUMED_RU_PER_SEC} RU/s."
+            fi
+
+            cosmos_json=$(retail_query "serviceName%20eq%20'Azure%20Cosmos%20DB%20RUs'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20contains(meterName,'100%20RU%2Fs')")
+            cosmos_price=$(first_matching_field "$cosmos_json" '.Items[] | select(.type == "Consumption") | .unitPrice')
+            cosmos_meter=$(first_matching_field "$cosmos_json" '.Items[] | select(.type == "Consumption") | .meterName')
+            cosmos_unit=$(first_matching_field "$cosmos_json" '.Items[] | select(.type == "Consumption") | .unitOfMeasure')
+
+            if [[ -n "$cosmos_price" && "$cosmos_price" != "null" ]]; then
+              cosmos_monthly=$(awk -v p="$cosmos_price" -v h="$HOURS_PER_MONTH" -v ru="$ru_units" 'BEGIN { printf "£%.2f", p * h * ru }')
+              append_price_row "$resource_type" "$cosmos_meter" "£$cosmos_price" "$cosmos_unit" "$cosmos_monthly" "${assumption_note} Monthly estimate is calculated as £$cosmos_price x ${HOURS_PER_MONTH} hours x ${ru_units} units of 100 RU/s."
+
+              if [[ "$action" == "Modified" ]]; then
+                old_throughput=$(tf_attr_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" "throughput")
+                old_autoscale_throughput=$(tf_attr_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" "max_throughput")
+                if [[ -n "$old_autoscale_throughput" ]]; then
+                  old_ru_units=$(awk -v t="$old_autoscale_throughput" 'BEGIN { printf "%.2f", t / 100 }')
+                elif [[ -n "$old_throughput" ]]; then
+                  old_ru_units=$(awk -v t="$old_throughput" 'BEGIN { printf "%.2f", t / 100 }')
+                else
+                  old_ru_units=$(awk -v t="$COSMOS_ASSUMED_RU_PER_SEC" 'BEGIN { printf "%.2f", t / 100 }')
+                fi
+                old_cosmos_monthly=$(awk -v p="$cosmos_price" -v h="$HOURS_PER_MONTH" -v ru="$old_ru_units" 'BEGIN { printf "%.2f", p * h * ru }')
+              fi
+
+              add_estimate_with_optional_delta "$action" "$address" "${cosmos_monthly#£}" "$old_cosmos_monthly" "Cosmos DB Throughput" "$assumption_note Live Azure retail price from meter $cosmos_meter at £$cosmos_price per hour for each 100 RU/s."
+            else
+              record_unestimated_resource "$action" "$address" "Cosmos DB Throughput" "Retail pricing query did not return a usable Cosmos DB RU price row."
+            fi
+          }
+
+          resource_service_aliases() {
+            local resource_type="$1"
+            case "$resource_type" in
+              azurerm_container_registry)
+                printf '%s\n' "Container Registry"
+                ;;
+              azurerm_log_analytics_workspace)
+                printf '%s\n' "Log Analytics"
+                ;;
+              azurerm_key_vault)
+                printf '%s\n' "Key Vault"
+                ;;
+              azurerm_linux_virtual_machine|azurerm_windows_virtual_machine|azurerm_virtual_machine)
+                printf '%s\n' "Virtual Machines"
+                ;;
+              azurerm_public_ip)
+                printf '%s\n' "IP Addresses"
+                ;;
+              azurerm_application_gateway)
+                printf '%s\n' "Application Gateway"
+                ;;
+              azurerm_lb)
+                printf '%s\n' "Load Balancer"
+                ;;
+              azurerm_cosmosdb_account|azurerm_cosmosdb_sql_database|azurerm_cosmosdb_sql_container|azurerm_cosmosdb_mongo_database|azurerm_cosmosdb_mongo_collection)
+                printf '%s\n' "Azure Cosmos DB"
+                ;;
+              *)
+                local derived
+                derived=$(echo "$resource_type" | sed 's/^azurerm_//' | tr '_' ' ' | awk '{for (i=1; i<=NF; i++) {$i=toupper(substr($i,1,1)) tolower(substr($i,2))} print}')
+                printf '%s\n' "$derived" "Azure $derived"
+                ;;
+            esac
+          }
+
+          resource_sku_value() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local sku_value
+            for attr_name in sku_name sku tier service_tier size vm_size; do
+              sku_value=$(tf_attr_for_address "$resource_type" "$resource_name" "$attr_name")
+              if [[ -n "$sku_value" ]]; then
+                printf '%s\n' "$sku_value"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          resource_sku_value_in_dir() {
+            local dir_path="$1"
+            local resource_type="$2"
+            local resource_name="$3"
+            local sku_value
+            for attr_name in sku_name sku tier service_tier size vm_size; do
+              sku_value=$(tf_attr_in_dir "$dir_path" "$resource_type" "$resource_name" "$attr_name")
+              if [[ -n "$sku_value" ]]; then
+                printf '%s\n' "$sku_value"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          base64_decode() {
+            printf '%s' "$1" | base64 --decode
+          }
+
+          select_generic_pricing_item() {
+            local json_input="$1"
+            local sku_value="$2"
+            echo "$json_input" | jq -r --arg sku "${sku_value,,}" '
+              [
+                .Items[]
+                | select(.type == "Consumption")
+                | select(((.meterName // "") | ascii_downcase | contains("secondary")) | not)
+                | select(((.productName // "") | ascii_downcase | contains("dev/test")) | not)
+                | select(
+                    ($sku == "") or
+                    (((.skuName // "") | ascii_downcase) == $sku) or
+                    (((.skuName // "") | ascii_downcase) | contains($sku)) or
+                    (((.productName // "") | ascii_downcase) | contains($sku)) or
+                    (((.meterName // "") | ascii_downcase) | contains($sku))
+                  )
+              ]
+              | sort_by(
+                  if ((.unitOfMeasure // "") | ascii_downcase | test("hour")) then 0
+                  elif ((.unitOfMeasure // "") | ascii_downcase | test("/month|month")) then 1
+                  elif ((.unitOfMeasure // "") | ascii_downcase | test("day")) then 2
+                  elif ((.unitOfMeasure // "") | ascii_downcase | test("gb")) then 3
+                  elif ((.unitOfMeasure // "") | ascii_downcase | test("10k")) then 4
+                  else 9
+                  end
+                )
+              | .[0] | @base64
+            ' | head -1
+          }
+
+          quantity_for_generic_meter() {
+            local service_name="$1"
+            local unit_of_measure="$2"
+            local meter_name="$3"
+            local unit_lower meter_lower
+            unit_lower=$(echo "$unit_of_measure" | tr '[:upper:]' '[:lower:]')
+            meter_lower=$(echo "$meter_name" | tr '[:upper:]' '[:lower:]')
+
+            if [[ "$unit_lower" == *"hour"* ]]; then
+              printf '%s|hours' "$HOURS_PER_MONTH"
+              return 0
+            fi
+
+            if [[ "$unit_lower" == *"day"* ]]; then
+              printf '%s|days' "$DAYS_PER_MONTH"
+              return 0
+            fi
+
+            if [[ "$unit_lower" == *"gb/month"* ]] || [[ "$meter_lower" == *"data stored"* ]] || [[ "$meter_lower" == *"data retention"* ]]; then
+              case "$service_name" in
+                "Log Analytics")
+                  printf '%s|GB-Month' "$LOG_ANALYTICS_ASSUMED_GB_MONTH"
+                  ;;
+                "Container Registry")
+                  printf '%s|GB-Month' "$CONTAINER_REGISTRY_ASSUMED_GB_MONTH"
+                  ;;
+                *)
+                  printf '%s|GB-Month' "$GENERIC_STORAGE_ASSUMED_GB_MONTH"
+                  ;;
+              esac
+              return 0
+            fi
+
+            if [[ "$unit_lower" == "1 gb" ]]; then
+              case "$service_name" in
+                "Log Analytics")
+                  printf '%s|GB' "$LOG_ANALYTICS_ASSUMED_GB_MONTH"
+                  return 0
+                  ;;
+              esac
+            fi
+
+            if [[ "$unit_lower" == *"/month"* ]]; then
+              printf '1|month'
+              return 0
+            fi
+
+            if [[ "$unit_lower" == *"10k"* ]] || [[ "$meter_lower" == *"operation"* ]] || [[ "$meter_lower" == *"call"* ]] || [[ "$meter_lower" == *"request"* ]]; then
+              printf '%s|10K units' "$GENERIC_10K_UNITS_ASSUMED_PER_MONTH"
+              return 0
+            fi
+
+            return 1
+          }
+
+          estimate_generic_monthly_amount() {
+            local service_name="$1"
+            local price="$2"
+            local unit_of_measure="$3"
+            local meter_name="$4"
+            local quantity_info quantity usage_unit
+            quantity_info=$(quantity_for_generic_meter "$service_name" "$unit_of_measure" "$meter_name") || return 1
+            quantity=${quantity_info%%|*}
+            usage_unit=${quantity_info#*|}
+            awk -v p="$price" -v q="$quantity" 'BEGIN { printf "%.2f", p * q }'
+            printf '|%s|%s' "$quantity" "$usage_unit" >&2
+          }
+
+          record_generic_retail_estimate() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local action="$3"
+            local address="$resource_type.$resource_name"
+            local sku_value aliases service_name service_json selected_item decoded_item unit_price meter_name unit_of_measure monthly_amount quantity_info quantity usage_unit notes old_sku old_service_json old_selected_item old_decoded_item old_unit_price old_meter_name old_unit_of_measure old_monthly_amount
+
+            sku_value=$(resource_sku_value "$resource_type" "$resource_name") || return 1
+            aliases=$(resource_service_aliases "$resource_type")
+
+            while IFS= read -r service_name; do
+              [[ -z "$service_name" ]] && continue
+              service_json=$(retail_query "serviceName%20eq%20'$(printf '%s' "$service_name" | jq -sRr @uri)'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'")
+              selected_item=$(select_generic_pricing_item "$service_json" "$sku_value")
+              [[ -z "$selected_item" || "$selected_item" == "null" ]] && continue
+
+              decoded_item=$(base64_decode "$selected_item")
+              unit_price=$(echo "$decoded_item" | jq -r '.unitPrice')
+              meter_name=$(echo "$decoded_item" | jq -r '.meterName')
+              unit_of_measure=$(echo "$decoded_item" | jq -r '.unitOfMeasure')
+
+              [[ -z "$unit_price" || "$unit_price" == "null" ]] && continue
+
+              quantity_info=$(quantity_for_generic_meter "$service_name" "$unit_of_measure" "$meter_name") || continue
+              quantity=${quantity_info%%|*}
+              usage_unit=${quantity_info#*|}
+              monthly_amount=$(awk -v p="$unit_price" -v q="$quantity" 'BEGIN { printf "%.2f", p * q }')
+              append_price_row "$resource_type" "$meter_name" "£$unit_price" "$unit_of_measure" "£$monthly_amount" "Generic fallback matched service $service_name with assumed ${quantity} ${usage_unit}."
+
+              if [[ "$action" == "Modified" ]]; then
+                old_sku=$(resource_sku_value_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" 2>/dev/null || true)
+                if [[ -n "$old_sku" ]]; then
+                  old_service_json=$(retail_query "serviceName%20eq%20'$(printf '%s' "$service_name" | jq -sRr @uri)'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'")
+                  old_selected_item=$(select_generic_pricing_item "$old_service_json" "$old_sku")
+                  if [[ -n "$old_selected_item" && "$old_selected_item" != "null" ]]; then
+                    old_decoded_item=$(base64_decode "$old_selected_item")
+                    old_unit_price=$(echo "$old_decoded_item" | jq -r '.unitPrice')
+                    old_meter_name=$(echo "$old_decoded_item" | jq -r '.meterName')
+                    old_unit_of_measure=$(echo "$old_decoded_item" | jq -r '.unitOfMeasure')
+                    if [[ -n "$old_unit_price" && "$old_unit_price" != "null" ]]; then
+                      old_monthly_amount=$(awk -v p="$old_unit_price" -v q="$quantity" 'BEGIN { printf "%.2f", p * q }')
+                    fi
+                  fi
+                fi
+              fi
+
+              notes="Generic Azure Retail Prices fallback using service ${service_name}, meter ${meter_name}, and assumed ${quantity} ${usage_unit}."
+              add_estimate_with_optional_delta "$action" "$address" "$monthly_amount" "$old_monthly_amount" "$sku_value" "$notes"
+              return 0
+            done <<< "$aliases"
+
+            return 1
+          }
+
           echo "### Live Retail Prices" >> /tmp/azure-pricing.md
           echo "| Resource | Azure Retail Meter | Unit Price | Unit | Monthly Estimate | Notes |" >> /tmp/azure-pricing.md
           echo "|----------|--------------------|------------|------|------------------|-------|" >> /tmp/azure-pricing.md
@@ -744,6 +1018,12 @@ jobs:
               azurerm_application_insights)
                 record_application_insights "$resource_type" "$resource_name" "$action"
                 ;;
+              azurerm_cosmosdb_account)
+                add_zero_cost_resource "$action" "$resource_address" "No direct base charge" "The Cosmos DB account shell is not priced separately here; throughput, storage, and backup charges are estimated from child database or container resources."
+                ;;
+              azurerm_cosmosdb_sql_database|azurerm_cosmosdb_sql_container|azurerm_cosmosdb_mongo_database|azurerm_cosmosdb_mongo_collection)
+                record_cosmos_throughput_resource "$resource_type" "$resource_name" "$action"
+                ;;
               azurerm_api_management)
                 record_api_management "$resource_type" "$resource_name" "$action"
                 ;;
@@ -766,7 +1046,9 @@ jobs:
                 add_zero_cost_resource "$action" "$resource_address" "No direct base charge" "The resource group itself does not incur a direct Azure usage charge."
                 ;;
               *)
-                record_unestimated_resource "$action" "$resource_address" "$resource_type" "Resource detected dynamically, but no pricing handler is configured yet for this Azure resource type."
+                if ! record_generic_retail_estimate "$resource_type" "$resource_name" "$action"; then
+                  record_unestimated_resource "$action" "$resource_address" "$resource_type" "Resource detected dynamically, but no pricing handler or generic Retail Prices fallback matched this Azure resource type yet."
+                fi
                 ;;
             esac
           done < <(resource_inventory)

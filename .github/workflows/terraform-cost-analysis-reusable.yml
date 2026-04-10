@@ -79,7 +79,6 @@ permissions:
   contents: read
   pull-requests: write
   id-token: write
-  models: read
 
 jobs:
   analyze:
@@ -203,8 +202,14 @@ jobs:
 
           resource_inventory() {
             awk '
-              match($0, /^resource "([^"]+)" "([^"]+)"/, matches) {
-                print matches[1] "|" matches[2]
+              /^resource "/ {
+                line = $0
+                sub(/^resource "/, "", line)
+                split(line, parts, /" "/)
+                resource_type = parts[1]
+                resource_name = parts[2]
+                sub(/".*/, "", resource_name)
+                print resource_type "|" resource_name
               }
             ' "$TF_DIR"/*.tf 2>/dev/null | sort -u
           }

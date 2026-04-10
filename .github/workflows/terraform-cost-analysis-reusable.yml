@@ -68,11 +68,14 @@ on:
       AZURE_SUBSCRIPTION_ID:
         description: 'Azure Subscription ID'
         required: true
+      AZURE_CLIENT_SECRET:
+        description: 'Azure Service Principal Client Secret'
+        required: true
 
 permissions:
   contents: read
   pull-requests: write
-  id-token: write  # Required for OIDC authentication
+  id-token: write
 
 jobs:
   analyze:
@@ -96,13 +99,11 @@ jobs:
         with:
           terraform_wrapper: false
 
-      # Azure Login using OIDC
+      # Azure Login using Service Principal
       - name: Azure Login
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}"}'
 
       - name: Install Azure CLI Extensions
         run: |

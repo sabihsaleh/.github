@@ -68,9 +68,6 @@ on:
       AZURE_SUBSCRIPTION_ID:
         description: 'Azure Subscription ID'
         required: true
-      AZURE_CLIENT_SECRET:
-        description: 'Azure Service Principal Secret (if not using OIDC)'
-        required: false
 
 permissions:
   contents: read
@@ -99,26 +96,13 @@ jobs:
         with:
           terraform_wrapper: false
 
-      # Azure Login using OIDC (preferred) or Service Principal
-      - name: Azure Login (OIDC)
-        if: ${{ secrets.AZURE_CLIENT_SECRET == '' }}
+      # Azure Login using OIDC
+      - name: Azure Login
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Azure Login (Service Principal)
-        if: ${{ secrets.AZURE_CLIENT_SECRET != '' }}
-        uses: azure/login@v2
-        with:
-          creds: |
-            {
-              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
-              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
-              "tenantId": "${{ secrets.AZURE_TENANT_ID }}",
-              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
-            }
 
       - name: Install Azure CLI Extensions
         run: |

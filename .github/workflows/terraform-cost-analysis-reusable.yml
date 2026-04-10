@@ -270,6 +270,111 @@ jobs:
           set +e  # Disable exit on error for this script
           TF_DIR="${{ inputs.terraform_directory }}"
           IFS=',' read -ra REQUIRED_TAGS <<< "${{ inputs.required_tags }}"
+
+          trim() {
+            local value="$1"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            printf '%s' "$value"
+          }
+
+          extract_map_keys() {
+            local start_pattern="$1"
+            local file_path="$2"
+            awk -v pattern="$start_pattern" '
+              BEGIN { in_map = 0; depth = 0 }
+              !in_map && $0 ~ pattern {
+                in_map = 1
+                depth = gsub(/\{/, "&") - gsub(/\}/, "&")
+                next
+              }
+              in_map {
+                open_count = gsub(/\{/, "&")
+                close_count = gsub(/\}/, "&")
+                if ($0 !~ /^[[:space:]]*#/ && $0 !~ /^[[:space:]]*\/\// && $0 ~ /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=/) {
+                  key = $0
+                  sub(/^[[:space:]]*/, "", key)
+                  sub(/[[:space:]]*=.*/, "", key)
+                  print key
+                }
+                depth += open_count - close_count
+                if (depth <= 0) {
+                  exit
+                }
+              }
+            ' "$file_path" 2>/dev/null
+          }
+
+          resolve_local_tags() {
+            local map_name="$1"
+            local map_keys=""
+            while IFS= read -r tf_file; do
+              [[ -z "$tf_file" ]] && continue
+              found_keys=$(extract_map_keys "^[[:space:]]*${map_name}[[:space:]]*=[[:space:]]*\\{" "$tf_file")
+              if [[ -n "$found_keys" ]]; then
+                map_keys+=$'\n'"$found_keys"
+              fi
+            done < <(find "$TF_DIR" -name "*.tf" -type f 2>/dev/null)
+            printf '%s\n' "$map_keys" | sed '/^$/d' | sort -u
+          }
+
+          collect_defined_tags() {
+            local block_content="$1"
+            local file_path="$2"
+            local tag_assign_line
+            tag_assign_line=$(printf '%s\n' "$block_content" | grep -E '^[[:space:]]*tags[[:space:]]*=' | head -1)
+
+            if [[ -z "$tag_assign_line" ]]; then
+              return
+            fi
+
+            if [[ "$tag_assign_line" =~ tags[[:space:]]*=[[:space:]]*local\.([A-Za-z0-9_]+) ]]; then
+              resolve_local_tags "${BASH_REMATCH[1]}"
+              return
+            fi
+
+            if [[ "$tag_assign_line" =~ tags[[:space:]]*=[[:space:]]*merge\([[:space:]]*local\.([A-Za-z0-9_]+) ]]; then
+              resolve_local_tags "${BASH_REMATCH[1]}"
+              printf '%s\n' "$block_content" | awk '
+                BEGIN { in_tags = 0; depth = 0 }
+                !in_tags && $0 ~ /^[[:space:]]*tags[[:space:]]*=[[:space:]]*merge\(/ { in_tags = 1 }
+                in_tags {
+                  if ($0 ~ /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=/) {
+                    key = $0
+                    sub(/^[[:space:]]*/, "", key)
+                    sub(/[[:space:]]*=.*/, "", key)
+                    if (key != "tags") print key
+                  }
+                  depth += gsub(/\(/, "&") + gsub(/\{/, "&")
+                  depth -= gsub(/\)/, "&") + gsub(/\}/, "&")
+                  if (in_tags && depth <= 0) exit
+                }
+              ' | sed '/^$/d' | sort -u
+              return
+            fi
+
+            if [[ "$tag_assign_line" =~ tags[[:space:]]*=[[:space:]]*\{ ]]; then
+              printf '%s\n' "$block_content" | awk '
+                BEGIN { in_tags = 0; depth = 0 }
+                !in_tags && $0 ~ /^[[:space:]]*tags[[:space:]]*=[[:space:]]*\{/ {
+                  in_tags = 1
+                  depth = 1
+                  next
+                }
+                in_tags {
+                  if ($0 ~ /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=/) {
+                    key = $0
+                    sub(/^[[:space:]]*/, "", key)
+                    sub(/[[:space:]]*=.*/, "", key)
+                    print key
+                  }
+                  depth += gsub(/\{/, "&")
+                  depth -= gsub(/\}/, "&")
+                  if (depth <= 0) exit
+                }
+              ' | sed '/^$/d' | sort -u
+            fi
+          }
           
           echo "## Tag Validation Report" > /tmp/tag-validation.md
           echo "" >> /tmp/tag-validation.md
@@ -296,6 +401,24 @@ jobs:
                   echo "**File:** \`$file\` | **Issue:** No tags block" >> /tmp/tag-validation.md
                   echo "" >> /tmp/tag-validation.md
                   MISSING_TAGS=$((MISSING_TAGS + ${#REQUIRED_TAGS[@]}))
+                else
+                  defined_tags=$(collect_defined_tags "$block_content" "$file")
+                  missing_for_resource=()
+
+                  for required_tag in "${REQUIRED_TAGS[@]}"; do
+                    required_tag=$(trim "$required_tag")
+                    [[ -z "$required_tag" ]] && continue
+                    if ! printf '%s\n' "$defined_tags" | grep -Fxq "$required_tag"; then
+                      missing_for_resource+=("$required_tag")
+                    fi
+                  done
+
+                  if [[ ${#missing_for_resource[@]} -gt 0 ]]; then
+                    echo "### ❌ \`$resource_type.$resource_name\`" >> /tmp/tag-validation.md
+                    echo "**File:** \`$file\` | **Missing Tags:** ${missing_for_resource[*]}" >> /tmp/tag-validation.md
+                    echo "" >> /tmp/tag-validation.md
+                    MISSING_TAGS=$((MISSING_TAGS + ${#missing_for_resource[@]}))
+                  fi
                 fi
               fi
             done <<< "$(grep -n "^resource \"azurerm_" "$file" 2>/dev/null || true)"
@@ -306,7 +429,7 @@ jobs:
           
           if [[ $MISSING_TAGS -eq 0 ]]; then
             echo "" >> /tmp/tag-validation.md
-            echo "✅ **All resources have tags configured!**" >> /tmp/tag-validation.md
+            echo "✅ **All resources contain the required tag keys.**" >> /tmp/tag-validation.md
           fi
           
           echo "missing_tags=$MISSING_TAGS" >> $GITHUB_OUTPUT

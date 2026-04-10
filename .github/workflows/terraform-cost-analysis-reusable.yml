@@ -172,12 +172,17 @@ jobs:
           DAYS_PER_MONTH=30
           TOTAL_FIXED=0
           HAS_VARIABLE=0
+          HAS_GAPS=0
+          STORAGE_ASSUMED_GB_MONTH=756
+          APP_INSIGHTS_ASSUMED_GB_MONTH=30
+          SERVICE_BUS_BASIC_ASSUMED_OPERATIONS_MILLIONS=5
 
-          tf_attr() {
+          tf_attr_for_address() {
             local resource_type="$1"
-            local attr_name="$2"
-            awk -v resource_type="$resource_type" -v attr_name="$attr_name" '
-              $0 ~ "^resource \"" resource_type "\"" { in_block = 1; depth = 0 }
+            local resource_name="$2"
+            local attr_name="$3"
+            awk -v resource_type="$resource_type" -v resource_name="$resource_name" -v attr_name="$attr_name" '
+              $0 ~ "^resource \"" resource_type "\" \"" resource_name "\"" { in_block = 1; depth = 0 }
               in_block {
                 open_count = gsub(/\{/, "&")
                 close_count = gsub(/\}/, "&")
@@ -196,17 +201,12 @@ jobs:
             ' "$TF_DIR"/*.tf 2>/dev/null | head -1
           }
 
-          tf_resource_address() {
-            local resource_type="$1"
-            awk -v resource_type="$resource_type" '
-              $0 ~ "^resource \"" resource_type "\" \"" {
-                match($0, /^resource \"[^\"]+\" \"([^\"]+)\"/, matches)
-                if (matches[1] != "") {
-                  print resource_type "." matches[1]
-                  exit
-                }
+          resource_inventory() {
+            awk '
+              match($0, /^resource "([^"]+)" "([^"]+)"/, matches) {
+                print matches[1] "|" matches[2]
               }
-            ' "$TF_DIR"/*.tf 2>/dev/null | head -1
+            ' "$TF_DIR"/*.tf 2>/dev/null | sort -u
           }
 
           plan_action() {
@@ -243,9 +243,27 @@ jobs:
             echo "| **$action** | \`$address\` | $monthly_estimate | $tier | $notes |" >> /tmp/cost-impact.md
             if [[ "$monthly_estimate" =~ ^£([0-9]+\.?[0-9]*)$ ]]; then
               TOTAL_FIXED=$(awk -v a="$TOTAL_FIXED" -v b="${BASH_REMATCH[1]}" 'BEGIN { printf "%.2f", a + b }')
+            elif [[ "$monthly_estimate" == Not\ estimated* ]]; then
+              HAS_GAPS=1
             else
               HAS_VARIABLE=1
             fi
+          }
+
+          add_zero_cost_resource() {
+            local action="$1"
+            local address="$2"
+            local tier="$3"
+            local notes="$4"
+            append_cost_row "$action" "$address" "£0.00" "$tier" "$notes"
+          }
+
+          record_unestimated_resource() {
+            local action="$1"
+            local address="$2"
+            local tier="$3"
+            local notes="$4"
+            append_cost_row "$action" "$address" "Not estimated" "$tier" "$notes"
           }
 
           retail_query() {
@@ -253,94 +271,249 @@ jobs:
             curl -s "${RETAIL_API}&\$filter=${filter}" 2>/dev/null
           }
 
+          first_matching_field() {
+            local json_input="$1"
+            local jq_filter="$2"
+            echo "$json_input" | jq -r "$jq_filter" | head -1
+          }
+
+          record_storage_account() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local action="$3"
+            local address="$resource_type.$resource_name"
+            local storage_tier storage_replication storage_json storage_price storage_meter storage_unit storage_monthly
+
+            storage_tier=$(tf_attr_for_address "$resource_type" "$resource_name" "account_tier")
+            storage_replication=$(tf_attr_for_address "$resource_type" "$resource_name" "account_replication_type")
+
+            if [[ "$storage_tier" == "Premium" && "$storage_replication" == "LRS" ]]; then
+              storage_json=$(retail_query "serviceName%20eq%20'Storage'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20contains(productName,'Premium%20Block%20Blob')%20and%20contains(skuName,'Premium%20LRS')%20and%20contains(meterName,'Data%20Stored')")
+            elif [[ "$storage_tier" == "Standard" && "$storage_replication" == "LRS" ]]; then
+              storage_json=$(retail_query "serviceName%20eq%20'Storage'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20contains(productName,'General%20Block%20Blob%20v2')%20and%20contains(skuName,'Hot%20LRS')%20and%20contains(meterName,'Data%20Stored')")
+            else
+              record_unestimated_resource "$action" "$address" "${storage_tier}_${storage_replication}" "No pricing rule is configured yet for this storage tier and replication combination."
+              return
+            fi
+
+            storage_price=$(first_matching_field "$storage_json" '.Items[] | select(.type == "Consumption") | .unitPrice')
+            storage_meter=$(first_matching_field "$storage_json" '.Items[] | select(.type == "Consumption") | .meterName')
+            storage_unit=$(first_matching_field "$storage_json" '.Items[] | select(.type == "Consumption") | .unitOfMeasure')
+
+            if [[ -n "$storage_price" && "$storage_price" != "null" ]]; then
+              storage_monthly=$(awk -v p="$storage_price" -v gb="$STORAGE_ASSUMED_GB_MONTH" 'BEGIN { printf "£%.2f", p * gb }')
+              append_price_row "$resource_type" "$storage_meter" "£$storage_price" "$storage_unit" "$storage_monthly" "Assumes ${STORAGE_ASSUMED_GB_MONTH} GB-Month. Monthly estimate is calculated as £$storage_price x ${STORAGE_ASSUMED_GB_MONTH}."
+              append_cost_row "$action" "$address" "$storage_monthly" "${storage_tier}_${storage_replication}" "Assumes ${STORAGE_ASSUMED_GB_MONTH} GB-Month at £$storage_price per GB-Month from Azure Retail Prices."
+            else
+              record_unestimated_resource "$action" "$address" "${storage_tier}_${storage_replication}" "Retail pricing query did not return a usable storage price row."
+            fi
+          }
+
+          record_service_plan() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local action="$3"
+            local address="$resource_type.$resource_name"
+            local app_service_sku app_service_os filter_sku app_json app_price app_meter app_unit app_monthly
+
+            app_service_sku=$(tf_attr_for_address "$resource_type" "$resource_name" "sku_name")
+            app_service_os=$(tf_attr_for_address "$resource_type" "$resource_name" "os_type")
+            filter_sku=$(echo "$app_service_sku" | sed 's/\([0-9]\)v\([0-9]\)/\1%20v\2/g')
+            app_json=$(retail_query "serviceName%20eq%20'Azure%20App%20Service'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20contains(skuName,'${filter_sku}')")
+
+            if [[ "$app_service_os" == "Linux" ]]; then
+              app_price=$(first_matching_field "$app_json" '.Items[] | select(.type == "Consumption" and (.productName | contains("Linux"))) | .unitPrice')
+              app_meter=$(first_matching_field "$app_json" '.Items[] | select(.type == "Consumption" and (.productName | contains("Linux"))) | .meterName')
+              app_unit=$(first_matching_field "$app_json" '.Items[] | select(.type == "Consumption" and (.productName | contains("Linux"))) | .unitOfMeasure')
+            else
+              app_price=$(first_matching_field "$app_json" '.Items[] | select(.type == "Consumption") | .unitPrice')
+              app_meter=$(first_matching_field "$app_json" '.Items[] | select(.type == "Consumption") | .meterName')
+              app_unit=$(first_matching_field "$app_json" '.Items[] | select(.type == "Consumption") | .unitOfMeasure')
+            fi
+
+            if [[ -n "$app_price" && "$app_price" != "null" ]]; then
+              app_monthly=$(awk -v p="$app_price" -v h="$HOURS_PER_MONTH" 'BEGIN { printf "£%.2f", p * h }')
+              append_price_row "$resource_type" "$app_meter" "£$app_price" "$app_unit" "$app_monthly" "Monthly estimate is calculated as £$app_price x ${HOURS_PER_MONTH} hours."
+              append_cost_row "$action" "$address" "$app_monthly" "$app_service_sku" "Live Azure retail price from meter $app_meter at £$app_price per hour."
+            else
+              record_unestimated_resource "$action" "$address" "$app_service_sku" "Retail pricing query did not return a usable App Service price row."
+            fi
+          }
+
+          record_sql_database() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local action="$3"
+            local address="$resource_type.$resource_name"
+            local sql_sku sql_json sql_price sql_meter sql_unit sql_monthly
+
+            sql_sku=$(tf_attr_for_address "$resource_type" "$resource_name" "sku_name")
+            sql_json=$(retail_query "serviceName%20eq%20'SQL%20Database'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20skuName%20eq%20'${sql_sku}'")
+            sql_price=$(first_matching_field "$sql_json" '.Items[] | select(.type == "Consumption") | .unitPrice')
+            sql_meter=$(first_matching_field "$sql_json" '.Items[] | select(.type == "Consumption") | .meterName')
+            sql_unit=$(first_matching_field "$sql_json" '.Items[] | select(.type == "Consumption") | .unitOfMeasure')
+
+            if [[ -n "$sql_price" && "$sql_price" != "null" ]]; then
+              sql_monthly=$(awk -v p="$sql_price" -v d="$DAYS_PER_MONTH" 'BEGIN { printf "£%.2f", p * d }')
+              append_price_row "$resource_type" "$sql_meter" "£$sql_price" "$sql_unit" "$sql_monthly" "Monthly estimate is calculated as £$sql_price x ${DAYS_PER_MONTH} days."
+              append_cost_row "$action" "$address" "$sql_monthly" "$sql_sku" "Live Azure retail price from meter $sql_meter at £$sql_price per day."
+            else
+              record_unestimated_resource "$action" "$address" "$sql_sku" "Retail pricing query did not return a usable SQL Database price row."
+            fi
+          }
+
+          record_redis_cache() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local action="$3"
+            local address="$resource_type.$resource_name"
+            local redis_sku_name redis_capacity redis_sku redis_json redis_price redis_meter redis_unit redis_monthly
+
+            redis_sku_name=$(tf_attr_for_address "$resource_type" "$resource_name" "sku_name")
+            redis_capacity=$(tf_attr_for_address "$resource_type" "$resource_name" "capacity")
+            redis_sku="${redis_sku_name:0:1}${redis_capacity}"
+            redis_json=$(retail_query "serviceName%20eq%20'Redis%20Cache'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20skuName%20eq%20'${redis_sku}'")
+            redis_price=$(first_matching_field "$redis_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Cache Instance"))) | .unitPrice')
+            redis_meter=$(first_matching_field "$redis_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Cache Instance"))) | .meterName')
+            redis_unit=$(first_matching_field "$redis_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Cache Instance"))) | .unitOfMeasure')
+
+            if [[ -z "$redis_price" || "$redis_price" == "null" ]]; then
+              redis_price=$(first_matching_field "$redis_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Cache"))) | .unitPrice')
+              redis_meter=$(first_matching_field "$redis_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Cache"))) | .meterName')
+              redis_unit=$(first_matching_field "$redis_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Cache"))) | .unitOfMeasure')
+            fi
+
+            if [[ -n "$redis_price" && "$redis_price" != "null" ]]; then
+              redis_monthly=$(awk -v p="$redis_price" -v h="$HOURS_PER_MONTH" 'BEGIN { printf "£%.2f", p * h }')
+              append_price_row "$resource_type" "$redis_meter" "£$redis_price" "$redis_unit" "$redis_monthly" "Monthly estimate is calculated as £$redis_price x ${HOURS_PER_MONTH} hours."
+              append_cost_row "$action" "$address" "$redis_monthly" "${redis_sku_name}_${redis_sku}" "Live Azure retail price from meter $redis_meter at £$redis_price per hour."
+            else
+              record_unestimated_resource "$action" "$address" "${redis_sku_name}_${redis_sku}" "Retail pricing query did not return a usable Redis price row."
+            fi
+          }
+
+          record_application_insights() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local action="$3"
+            local address="$resource_type.$resource_name"
+            local ai_json ai_price ai_meter ai_unit ai_monthly
+
+            ai_json=$(retail_query "serviceName%20eq%20'Application%20Insights'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20skuName%20eq%20'Basic'%20and%20contains(meterName,'Data%20Retention')")
+            ai_price=$(first_matching_field "$ai_json" '.Items[] | select(.type == "Consumption") | .unitPrice')
+            ai_meter=$(first_matching_field "$ai_json" '.Items[] | select(.type == "Consumption") | .meterName')
+            ai_unit=$(first_matching_field "$ai_json" '.Items[] | select(.type == "Consumption") | .unitOfMeasure')
+
+            if [[ -n "$ai_price" && "$ai_price" != "null" ]]; then
+              ai_monthly=$(awk -v p="$ai_price" -v gb="$APP_INSIGHTS_ASSUMED_GB_MONTH" 'BEGIN { printf "£%.2f", p * gb }')
+              append_price_row "$resource_type" "$ai_meter" "£$ai_price" "$ai_unit" "$ai_monthly" "Assumes ${APP_INSIGHTS_ASSUMED_GB_MONTH} GB-Month retained. Monthly estimate is calculated as £$ai_price x ${APP_INSIGHTS_ASSUMED_GB_MONTH}."
+              append_cost_row "$action" "$address" "$ai_monthly" "Application Insights Basic" "Assumes ${APP_INSIGHTS_ASSUMED_GB_MONTH} GB-Month retained at £$ai_price per GB-Month from Azure Retail Prices."
+            else
+              record_unestimated_resource "$action" "$address" "Application Insights" "Retail pricing query did not return a usable Application Insights price row."
+            fi
+          }
+
+          record_service_bus_namespace() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local action="$3"
+            local address="$resource_type.$resource_name"
+            local sb_sku sb_capacity sb_json sb_price sb_meter sb_unit sb_monthly
+
+            sb_sku=$(tf_attr_for_address "$resource_type" "$resource_name" "sku")
+            sb_capacity=$(tf_attr_for_address "$resource_type" "$resource_name" "capacity")
+            [[ -z "$sb_capacity" ]] && sb_capacity=1
+            sb_json=$(retail_query "serviceName%20eq%20'Service%20Bus'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20skuName%20eq%20'${sb_sku}'")
+
+            if [[ "$sb_sku" == "Premium" ]]; then
+              sb_price=$(first_matching_field "$sb_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Premium Messaging Unit"))) | .unitPrice')
+              sb_meter=$(first_matching_field "$sb_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Premium Messaging Unit"))) | .meterName')
+              sb_unit=$(first_matching_field "$sb_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Premium Messaging Unit"))) | .unitOfMeasure')
+              if [[ -n "$sb_price" && "$sb_price" != "null" ]]; then
+                sb_monthly=$(awk -v p="$sb_price" -v h="$HOURS_PER_MONTH" -v c="$sb_capacity" 'BEGIN { printf "£%.2f", p * h * c }')
+                append_price_row "$resource_type" "$sb_meter" "£$sb_price" "$sb_unit" "$sb_monthly" "Monthly estimate is calculated as £$sb_price x ${HOURS_PER_MONTH} hours x ${sb_capacity} messaging unit(s)."
+                append_cost_row "$action" "$address" "$sb_monthly" "${sb_sku}_${sb_capacity}MU" "Live Azure retail price from meter $sb_meter at £$sb_price per hour with ${sb_capacity} messaging unit(s)."
+              else
+                record_unestimated_resource "$action" "$address" "$sb_sku" "Retail pricing query did not return a usable Service Bus Premium price row."
+              fi
+            elif [[ "$sb_sku" == "Standard" ]]; then
+              sb_price=$(first_matching_field "$sb_json" '.Items[] | select(.type == "Consumption" and .unitOfMeasure == "1/Month" and (.meterName | contains("Standard Base Unit"))) | .unitPrice')
+              sb_meter=$(first_matching_field "$sb_json" '.Items[] | select(.type == "Consumption" and .unitOfMeasure == "1/Month" and (.meterName | contains("Standard Base Unit"))) | .meterName')
+              sb_unit=$(first_matching_field "$sb_json" '.Items[] | select(.type == "Consumption" and .unitOfMeasure == "1/Month" and (.meterName | contains("Standard Base Unit"))) | .unitOfMeasure')
+              if [[ -n "$sb_price" && "$sb_price" != "null" ]]; then
+                sb_monthly=$(awk -v p="$sb_price" 'BEGIN { printf "£%.2f", p }')
+                append_price_row "$resource_type" "$sb_meter" "£$sb_price" "$sb_unit" "$sb_monthly" "Base namespace charge. Messaging operations are additional variable usage."
+                append_cost_row "$action" "$address" "$sb_monthly" "$sb_sku" "Uses the Standard Base Unit monthly charge from Azure Retail Prices. Messaging operations are additional variable usage."
+              else
+                record_unestimated_resource "$action" "$address" "$sb_sku" "Retail pricing query did not return a usable Service Bus Standard base unit row."
+              fi
+            elif [[ "$sb_sku" == "Basic" ]]; then
+              sb_price=$(first_matching_field "$sb_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Basic Messaging Operations"))) | .unitPrice')
+              sb_meter=$(first_matching_field "$sb_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Basic Messaging Operations"))) | .meterName')
+              sb_unit=$(first_matching_field "$sb_json" '.Items[] | select(.type == "Consumption" and (.meterName | contains("Basic Messaging Operations"))) | .unitOfMeasure')
+              if [[ -n "$sb_price" && "$sb_price" != "null" ]]; then
+                sb_monthly=$(awk -v p="$sb_price" -v m="$SERVICE_BUS_BASIC_ASSUMED_OPERATIONS_MILLIONS" 'BEGIN { printf "£%.2f", p * m }')
+                append_price_row "$resource_type" "$sb_meter" "£$sb_price" "$sb_unit" "$sb_monthly" "Assumes ${SERVICE_BUS_BASIC_ASSUMED_OPERATIONS_MILLIONS} million messaging operations per month."
+                append_cost_row "$action" "$address" "$sb_monthly" "$sb_sku" "Assumes ${SERVICE_BUS_BASIC_ASSUMED_OPERATIONS_MILLIONS} million messaging operations at £$sb_price per million operations from Azure Retail Prices."
+              else
+                record_unestimated_resource "$action" "$address" "$sb_sku" "Retail pricing query did not return a usable Service Bus Basic price row."
+              fi
+            else
+              record_unestimated_resource "$action" "$address" "$sb_sku" "No pricing rule is configured yet for this Service Bus SKU."
+            fi
+          }
+
           echo "### Live Retail Prices" >> /tmp/azure-pricing.md
           echo "| Resource | Azure Retail Meter | Unit Price | Unit | Monthly Estimate | Notes |" >> /tmp/azure-pricing.md
           echo "|----------|--------------------|------------|------|------------------|-------|" >> /tmp/azure-pricing.md
 
-          storage_tier=$(tf_attr "azurerm_storage_account" "account_tier")
-          storage_replication=$(tf_attr "azurerm_storage_account" "account_replication_type")
-          if [[ "$storage_tier" == "Premium" && "$storage_replication" == "LRS" ]]; then
-            storage_json=$(retail_query "serviceName%20eq%20'Storage'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20contains(productName,'Premium%20Block%20Blob')%20and%20contains(skuName,'Premium%20LRS')%20and%20contains(meterName,'Data%20Stored')")
-            storage_price=$(echo "$storage_json" | jq -r '.Items[] | select(.type == "Consumption") | .unitPrice' | head -1)
-            storage_meter=$(echo "$storage_json" | jq -r '.Items[] | select(.type == "Consumption") | .meterName' | head -1)
-            storage_unit=$(echo "$storage_json" | jq -r '.Items[] | select(.type == "Consumption") | .unitOfMeasure' | head -1)
-            if [[ -n "$storage_price" && "$storage_price" != "null" ]]; then
-              storage_example=$(awk -v p="$storage_price" 'BEGIN { printf "£%.2f", p * 756 }')
-              append_price_row "azurerm_storage_account" "$storage_meter" "£$storage_price" "$storage_unit" "Variable" "Usage-based. No exact monthly total without stored volume. Example: 756 GB-month is approximately $storage_example."
-              storage_address=$(tf_resource_address "azurerm_storage_account")
-              append_cost_row "$(plan_action "$storage_address")" "$storage_address" "Variable" "Premium LRS" "Live Azure retail unit price is £$storage_price per GB/Month. Example only: 756 GB-month is approximately $storage_example."
-            fi
-          fi
+          while IFS='|' read -r resource_type resource_name; do
+            [[ -z "$resource_type" || -z "$resource_name" ]] && continue
+            resource_address="$resource_type.$resource_name"
+            action=$(plan_action "$resource_address")
 
-          app_service_sku=$(tf_attr "azurerm_service_plan" "sku_name")
-          app_service_os=$(tf_attr "azurerm_service_plan" "os_type")
-          if [[ -n "$app_service_sku" ]]; then
-            app_service_filter_sku=$(echo "$app_service_sku" | sed 's/\([0-9]\)v\([0-9]\)/\1%20v\2/g')
-            app_json=$(retail_query "serviceName%20eq%20'Azure%20App%20Service'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20contains(skuName,'${app_service_filter_sku}')")
-            if [[ "$app_service_os" == "Linux" ]]; then
-              app_price=$(echo "$app_json" | jq -r '.Items[] | select(.type == "Consumption" and (.productName | contains("Linux"))) | .unitPrice' | head -1)
-              app_meter=$(echo "$app_json" | jq -r '.Items[] | select(.type == "Consumption" and (.productName | contains("Linux"))) | .meterName' | head -1)
-              app_unit=$(echo "$app_json" | jq -r '.Items[] | select(.type == "Consumption" and (.productName | contains("Linux"))) | .unitOfMeasure' | head -1)
-            else
-              app_price=$(echo "$app_json" | jq -r '.Items[] | select(.type == "Consumption") | .unitPrice' | head -1)
-              app_meter=$(echo "$app_json" | jq -r '.Items[] | select(.type == "Consumption") | .meterName' | head -1)
-              app_unit=$(echo "$app_json" | jq -r '.Items[] | select(.type == "Consumption") | .unitOfMeasure' | head -1)
-            fi
-            if [[ -n "$app_price" && "$app_price" != "null" ]]; then
-              app_monthly=$(awk -v p="$app_price" -v h="$HOURS_PER_MONTH" 'BEGIN { printf "£%.2f", p * h }')
-              append_price_row "azurerm_service_plan" "$app_meter" "£$app_price" "$app_unit" "$app_monthly" "Live retail price for ${app_service_os:-default} App Service SKU ${app_service_sku}."
-              app_address=$(tf_resource_address "azurerm_service_plan")
-              append_cost_row "$(plan_action "$app_address")" "$app_address" "$app_monthly" "$app_service_sku" "Live Azure retail price from meter $app_meter at £$app_price per hour."
-            fi
-          fi
-
-          web_app_address=$(tf_resource_address "azurerm_linux_web_app")
-          if [[ -n "$web_app_address" ]]; then
-            append_cost_row "$(plan_action "$web_app_address")" "$web_app_address" "£0.00" "Included in App Service Plan" "The web app itself does not add a separate base compute charge beyond the plan."
-          fi
-
-          sql_server_address=$(tf_resource_address "azurerm_mssql_server")
-          if [[ -n "$sql_server_address" ]]; then
-            append_cost_row "$(plan_action "$sql_server_address")" "$sql_server_address" "£0.00" "Included in SQL Database pricing" "The logical SQL server has no standalone base charge in this estimate."
-          fi
-
-          sql_sku=$(tf_attr "azurerm_mssql_database" "sku_name")
-          if [[ -n "$sql_sku" ]]; then
-            sql_json=$(retail_query "serviceName%20eq%20'SQL%20Database'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20skuName%20eq%20'${sql_sku}'")
-            sql_price=$(echo "$sql_json" | jq -r '.Items[] | select(.type == "Consumption") | .unitPrice' | head -1)
-            sql_meter=$(echo "$sql_json" | jq -r '.Items[] | select(.type == "Consumption") | .meterName' | head -1)
-            sql_unit=$(echo "$sql_json" | jq -r '.Items[] | select(.type == "Consumption") | .unitOfMeasure' | head -1)
-            if [[ -n "$sql_price" && "$sql_price" != "null" ]]; then
-              sql_monthly=$(awk -v p="$sql_price" -v d="$DAYS_PER_MONTH" 'BEGIN { printf "£%.2f", p * d }')
-              append_price_row "azurerm_mssql_database" "$sql_meter" "£$sql_price" "$sql_unit" "$sql_monthly" "Live retail price for SQL Database SKU ${sql_sku}."
-              sql_address=$(tf_resource_address "azurerm_mssql_database")
-              append_cost_row "$(plan_action "$sql_address")" "$sql_address" "$sql_monthly" "$sql_sku" "Live Azure retail price from meter $sql_meter at £$sql_price per day."
-            fi
-          fi
-
-          redis_sku_name=$(tf_attr "azurerm_redis_cache" "sku_name")
-          redis_capacity=$(tf_attr "azurerm_redis_cache" "capacity")
-          if [[ -n "$redis_sku_name" && -n "$redis_capacity" ]]; then
-            redis_sku="${redis_sku_name:0:1}${redis_capacity}"
-            redis_json=$(retail_query "serviceName%20eq%20'Redis%20Cache'%20and%20armRegionName%20eq%20'${{ inputs.azure_region }}'%20and%20skuName%20eq%20'${redis_sku}'")
-            redis_price=$(echo "$redis_json" | jq -r '.Items[] | select(.type == "Consumption" and (.productName | contains("Standard")) and (.meterName | contains("Cache"))) | .unitPrice' | sort -nr | head -1)
-            redis_meter=$(echo "$redis_json" | jq -r '.Items[] | select(.type == "Consumption" and (.productName | contains("Standard")) and (.meterName | contains("Cache"))) | .meterName' | head -1)
-            redis_unit=$(echo "$redis_json" | jq -r '.Items[] | select(.type == "Consumption" and (.productName | contains("Standard")) and (.meterName | contains("Cache"))) | .unitOfMeasure' | head -1)
-            if [[ -n "$redis_price" && "$redis_price" != "null" ]]; then
-              redis_monthly=$(awk -v p="$redis_price" -v h="$HOURS_PER_MONTH" 'BEGIN { printf "£%.2f", p * h }')
-              append_price_row "azurerm_redis_cache" "$redis_meter" "£$redis_price" "$redis_unit" "$redis_monthly" "Live retail price for Redis ${redis_sku_name} ${redis_sku}."
-              redis_address=$(tf_resource_address "azurerm_redis_cache")
-              append_cost_row "$(plan_action "$redis_address")" "$redis_address" "$redis_monthly" "${redis_sku_name}_${redis_sku}" "Live Azure retail price from meter $redis_meter at £$redis_price per hour."
-            fi
-          fi
-
-          insights_address=$(tf_resource_address "azurerm_application_insights")
-          if [[ -n "$insights_address" ]]; then
-            append_cost_row "$(plan_action "$insights_address")" "$insights_address" "Variable" "Application Insights" "Usage-based service. The retail API does not expose a single fixed monthly base cost for this Terraform definition."
-          fi
+            case "$resource_type" in
+              azurerm_storage_account)
+                record_storage_account "$resource_type" "$resource_name" "$action"
+                ;;
+              azurerm_service_plan)
+                record_service_plan "$resource_type" "$resource_name" "$action"
+                ;;
+              azurerm_linux_web_app|azurerm_windows_web_app)
+                add_zero_cost_resource "$action" "$resource_address" "Included in App Service Plan" "The web app itself does not add a separate base compute charge beyond the plan."
+                ;;
+              azurerm_mssql_server)
+                add_zero_cost_resource "$action" "$resource_address" "Included in SQL Database pricing" "The logical SQL server has no standalone base charge in this estimate."
+                ;;
+              azurerm_mssql_database)
+                record_sql_database "$resource_type" "$resource_name" "$action"
+                ;;
+              azurerm_redis_cache)
+                record_redis_cache "$resource_type" "$resource_name" "$action"
+                ;;
+              azurerm_application_insights)
+                record_application_insights "$resource_type" "$resource_name" "$action"
+                ;;
+              azurerm_servicebus_namespace)
+                record_service_bus_namespace "$resource_type" "$resource_name" "$action"
+                ;;
+              azurerm_servicebus_queue|azurerm_servicebus_topic|azurerm_servicebus_subscription)
+                add_zero_cost_resource "$action" "$resource_address" "Included in Service Bus namespace" "Entity pricing is included in the namespace estimate; usage and messaging charges are applied at the namespace level."
+                ;;
+              azurerm_resource_group)
+                add_zero_cost_resource "$action" "$resource_address" "No direct base charge" "The resource group itself does not incur a direct Azure usage charge."
+                ;;
+              *)
+                record_unestimated_resource "$action" "$resource_address" "$resource_type" "Resource detected dynamically, but no pricing handler is configured yet for this Azure resource type."
+                ;;
+            esac
+          done < <(resource_inventory)
 
           echo "" >> /tmp/cost-impact.md
-          if [[ "$HAS_VARIABLE" -eq 1 ]]; then
+          if [[ "$HAS_GAPS" -eq 1 ]]; then
+            echo "**Total Estimated Monthly Impact:** £${TOTAL_FIXED} + additional unsupported or usage-based components" >> /tmp/cost-impact.md
+            echo "**Confidence Level:** Medium (derived from live Azure retail pricing where available, with unsupported resource types called out explicitly)" >> /tmp/cost-impact.md
+          elif [[ "$HAS_VARIABLE" -eq 1 ]]; then
             echo "**Total Estimated Monthly Impact:** £${TOTAL_FIXED} + variable usage-based charges" >> /tmp/cost-impact.md
             echo "**Confidence Level:** High (derived from live Azure retail pricing, with usage-based resources called out explicitly)" >> /tmp/cost-impact.md
           else
@@ -843,10 +1016,6 @@ jobs:
                 analysis = analysis.replace(/### 💰 Cost Impact Analysis[\s\S]*?(?=\n### )/, `${deterministicCostSection}\n\n`);
               }
 
-              if (azurePricing.trim()) {
-                analysis = `${azurePricing}\n\n---\n\n${analysis}`;
-              }
-
               fs.writeFileSync('/tmp/copilot-analysis.md', analysis);
               
               // Check cost threshold
@@ -863,8 +1032,7 @@ jobs:
               
             } catch (error) {
               console.error('Error:', error);
-              const pricingPrefix = azurePricing.trim() ? `${azurePricing}\n\n---\n\n` : '';
-              const fallback = `${pricingPrefix}### ⚠️ AI Analysis Unavailable\n\n${error.message}\n\n${tagValidation}\n\n${azureAdvisor}\n\n${orphanedResources}`;
+              const fallback = `### ⚠️ AI Analysis Unavailable\n\n${error.message}\n\n${tagValidation}\n\n${azureAdvisor}\n\n${orphanedResources}`;
               fs.writeFileSync('/tmp/copilot-analysis.md', fallback);
             }
 

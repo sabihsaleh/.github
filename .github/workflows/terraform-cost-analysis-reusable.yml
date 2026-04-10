@@ -32,7 +32,7 @@ on:
         description: 'Azure region for cost estimation reference'
         required: false
         type: string
-        default: 'eastus'
+        default: 'northeurope'
       fail_on_missing_tags:
         description: 'Fail the workflow if required tags are missing'
         required: false

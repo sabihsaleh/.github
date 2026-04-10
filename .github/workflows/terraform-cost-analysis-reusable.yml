@@ -76,7 +76,6 @@ permissions:
   contents: read
   pull-requests: write
   id-token: write
-  models: read
 
 jobs:
   analyze:
@@ -310,9 +309,6 @@ jobs:
           
           if [[ "${{ inputs.fail_on_missing_tags }}" == "true" && $MISSING_TAGS -gt 0 ]]; then
             echo "::error::Missing required tags on $MISSING_TAGS resources"
-            exit 1
-          fi
-          exit 0echo "::error::Missing required tags on $MISSING_TAGS resources"
             exit 1
           fi
           exit 0

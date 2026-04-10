@@ -327,6 +327,7 @@ jobs:
           AI_MODEL: ${{ inputs.ai_model }}
           AZURE_REGION: ${{ inputs.azure_region }}
           COST_THRESHOLD: ${{ inputs.cost_threshold }}
+          CURRENT_DATE: ${{ github.event.pull_request.updated_at || github.run_id }}
         with:
           script: |
             const fs = require('fs');
@@ -343,9 +344,12 @@ jobs:
             
             const maxLen = 10000;
             const truncate = (str) => str.length > maxLen ? str.substring(0, maxLen) + '\n... (truncated)' : str;
+            const workflowDate = new Date().toISOString().slice(0, 10);
             
             const prompt = `You are an Azure Cost Optimization expert (similar to Azure's AzureCostOptimizeAgent). 
             Analyze the following Terraform changes and Azure data to provide comprehensive cost analysis.
+
+            Today's date is ${workflowDate}. Treat this as the pricing reference date for your narrative.
 
             ## YOUR MISSION
             1. **Estimate Cost Impact**: Calculate monthly cost changes based on Azure pricing for ${process.env.AZURE_REGION} region
@@ -353,6 +357,12 @@ jobs:
             3. **Tag Compliance**: Review tag validation
             4. **Security & Best Practices**: Identify issues
             5. **Actionable Recommendations**: Provide specific commands or changes
+
+            ## FRESHNESS RULES
+            - Use current-date language anchored to ${workflowDate}.
+            - Do not mention training cutoffs, knowledge cutoffs, or stale dates such as 2023.
+            - Do not say "as of 2023" or similar anywhere in the response.
+            - If exact live retail pricing cannot be proven from the supplied Azure data, say the estimate is based on current workflow data and set confidence to Medium instead of citing an old year.
 
             ## TERRAFORM PLAN OUTPUT
             ${truncate(tfPlan)}
@@ -438,7 +448,14 @@ jobs:
               }
               
               const data = await response.json();
-              const analysis = data.choices[0].message.content;
+              let analysis = data.choices[0].message.content;
+
+              analysis = analysis
+                .replace(/as of\s+[A-Za-z]+\s+20\d{2}/gi, `as of ${workflowDate}`)
+                .replace(/as of\s+20\d{2}/gi, `as of ${workflowDate}`)
+                .replace(/\*\*Confidence Level:\*\*\s*([^\n]*?)\s*\(based on[^\n)]*20\d{2}[^\n)]*\)/gi, '**Confidence Level:** $1 (based on current workflow data and Azure references)')
+                .replace(/based on Azure pricing for [^\n]*20\d{2}/gi, 'based on current workflow data and Azure references');
+
               fs.writeFileSync('/tmp/copilot-analysis.md', analysis);
               
               // Check cost threshold

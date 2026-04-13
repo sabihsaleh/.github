@@ -1468,7 +1468,7 @@ jobs:
           COMMON_MISSING_TAGS=""
           if [[ -s /tmp/tag-missing-pairs.txt ]]; then
             RESOURCES_MISSING_TAGS=$(awk -F'|' '{print $2}' /tmp/tag-missing-pairs.txt | sort -u | sed '/^$/d' | wc -l | tr -d ' ')
-            COMMON_MISSING_TAGS=$(awk -F'|' '{print $1}' /tmp/tag-missing-pairs.txt | sort -u | paste -sd ', ' -)
+            COMMON_MISSING_TAGS=$(awk -F'|' '{print $1}' /tmp/tag-missing-pairs.txt | sort -u | paste -sd ',' - | sed 's/,/, /g')
           fi
 
           echo "### Summary" >> /tmp/tag-validation.md
@@ -1482,7 +1482,7 @@ jobs:
           fi
           echo "" >> /tmp/tag-validation.md
 
-          echo "### Missing Tags Grouped by Tag" >> /tmp/tag-validation.md
+          echo "### Missing tags" >> /tmp/tag-validation.md
           if [[ -s /tmp/tag-missing-pairs.txt ]]; then
             for required_tag in "${REQUIRED_TAGS[@]}"; do
               required_tag=$(trim "$required_tag")
@@ -1767,25 +1767,31 @@ jobs:
             const analysis = fs.readFileSync('/tmp/copilot-analysis.md', 'utf8');
             const costImpact = fs.existsSync('/tmp/cost-impact.md') ? fs.readFileSync('/tmp/cost-impact.md', 'utf8') : '';
             const tagValidation = fs.existsSync('/tmp/tag-validation.md') ? fs.readFileSync('/tmp/tag-validation.md', 'utf8') : '';
-            const tagSummaryMatch = tagValidation.match(/### Summary[\s\S]*?(?=\n### Missing Tags Grouped by Tag|\n---|$)/);
+            const tagSummaryMatch = tagValidation.match(/### Summary[\s\S]*?(?=\n### Missing tags|\n---|$)/);
             const tagSummarySection = tagSummaryMatch ? tagSummaryMatch[0].trim() : '';
-            const groupedTagSectionMatch = tagValidation.match(/### Missing Tags Grouped by Tag[\s\S]*?(?=\n---|$)/);
+            const groupedTagSectionMatch = tagValidation.match(/### Missing tags[\s\S]*?(?=\n---|$)/);
             const groupedTagSection = groupedTagSectionMatch ? groupedTagSectionMatch[0].trim() : '';
-            const analysisWithoutCostSection = analysis.replace(/### 💰 Cost Impact Analysis[\s\S]*?(?=\n### |$)/, '').trim();
+            let analysisWithoutCostSection = analysis.replace(/### 💰 Cost Impact Analysis[\s\S]*?(?=\n### |$)/, '').trim();
+
+            if (tagSummarySection || groupedTagSection) {
+              const deterministicTagCompliance = [
+                '### 🏷️ Tag Compliance',
+                tagSummarySection,
+                groupedTagSection,
+              ].filter(Boolean).join('\n\n');
+
+              if (/### 🏷️ Tag Compliance/.test(analysisWithoutCostSection)) {
+                analysisWithoutCostSection = analysisWithoutCostSection.replace(/### 🏷️ Tag Compliance[\s\S]*?(?=\n### |$)/, `${deterministicTagCompliance}\n\n`);
+              } else {
+                analysisWithoutCostSection = `${analysisWithoutCostSection}\n\n${deterministicTagCompliance}`.trim();
+              }
+            }
             const body = `${commentMarker}
             ## 🤖 Azure Cost Analysis by GitHub Copilot
 
             ${costImpact ? `${costImpact}
 
             ` : ''}${analysisWithoutCostSection}
-
-            ${(tagSummarySection || groupedTagSection) ? `
-            ---
-
-            ${tagSummarySection ? `${tagSummarySection}
-
-            ` : ''}${groupedTagSection}
-            ` : ''}
 
             ---
             <sub>📊 **Analysis Details:** TF Directory: \`${{ inputs.terraform_directory }}\` | Region: \`${{ inputs.azure_region }}\` | Model: \`${{ inputs.ai_model }}\`</sub>

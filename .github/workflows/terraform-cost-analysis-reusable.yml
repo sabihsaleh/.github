@@ -185,6 +185,7 @@ jobs:
           SERVICE_BUS_BASIC_ASSUMED_OPERATIONS_MILLIONS=5
           APIM_CONSUMPTION_ASSUMED_10K_CALLS=100
           KEY_VAULT_ASSUMED_10K_OPERATIONS=1
+          AKS_DEFAULT_NODE_COUNT=1
           GENERIC_STORAGE_ASSUMED_GB_MONTH=50
           GENERIC_10K_UNITS_ASSUMED_PER_MONTH=100
           COSMOS_ASSUMED_RU_PER_SEC=400
@@ -754,6 +755,52 @@ jobs:
             fi
           }
 
+          record_kubernetes_cluster() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local action="$3"
+            local address="$resource_type.$resource_name"
+            local vm_size node_count aks_json vm_price vm_meter vm_unit vm_monthly old_vm_size old_node_count old_aks_json old_vm_price old_vm_monthly
+
+            vm_size=$(tf_attr_for_address "$resource_type" "$resource_name" "vm_size")
+            node_count=$(tf_attr_for_address "$resource_type" "$resource_name" "node_count")
+
+            [[ -z "$node_count" || "$node_count" == "null" ]] && node_count=$AKS_DEFAULT_NODE_COUNT
+
+            if [[ -z "$vm_size" || "$vm_size" == "null" ]]; then
+              record_unestimated_resource "$action" "$address" "AKS" "This resource is not currently supported"
+              return
+            fi
+
+            aks_json=$(retail_query "serviceName%20eq%20'Virtual%20Machines'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20armSkuName%20eq%20'${vm_size}'")
+            vm_price=$(first_matching_field "$aks_json" '.Items[] | select(.type == "Consumption" and (.unitOfMeasure | ascii_downcase | contains("hour")) and (.meterName | ascii_downcase | contains("spot") | not) and (.meterName | ascii_downcase | contains("low priority") | not) and (.productName | ascii_downcase | contains("windows") | not)) | .unitPrice')
+            vm_meter=$(first_matching_field "$aks_json" '.Items[] | select(.type == "Consumption" and (.unitOfMeasure | ascii_downcase | contains("hour")) and (.meterName | ascii_downcase | contains("spot") | not) and (.meterName | ascii_downcase | contains("low priority") | not) and (.productName | ascii_downcase | contains("windows") | not)) | .meterName')
+            vm_unit=$(first_matching_field "$aks_json" '.Items[] | select(.type == "Consumption" and (.unitOfMeasure | ascii_downcase | contains("hour")) and (.meterName | ascii_downcase | contains("spot") | not) and (.meterName | ascii_downcase | contains("low priority") | not) and (.productName | ascii_downcase | contains("windows") | not)) | .unitOfMeasure')
+
+            if [[ -n "$vm_price" && "$vm_price" != "null" ]]; then
+              vm_monthly=$(awk -v p="$vm_price" -v h="$HOURS_PER_MONTH" -v n="$node_count" 'BEGIN { printf "£%.2f", p * h * n }')
+              append_price_row "$resource_type" "$vm_meter" "£$vm_price" "$vm_unit" "$vm_monthly" "AKS node pool estimate using ${node_count} node(s) of ${vm_size}. Excludes managed disks, load balancer, bandwidth, and optional add-ons."
+
+              if [[ "$action" == "Modified" ]]; then
+                old_vm_size=$(tf_attr_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" "vm_size")
+                old_node_count=$(tf_attr_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" "node_count")
+                [[ -z "$old_node_count" || "$old_node_count" == "null" ]] && old_node_count=$AKS_DEFAULT_NODE_COUNT
+
+                if [[ -n "$old_vm_size" && "$old_vm_size" != "null" ]]; then
+                  old_aks_json=$(retail_query "serviceName%20eq%20'Virtual%20Machines'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20armSkuName%20eq%20'${old_vm_size}'")
+                  old_vm_price=$(first_matching_field "$old_aks_json" '.Items[] | select(.type == "Consumption" and (.unitOfMeasure | ascii_downcase | contains("hour")) and (.meterName | ascii_downcase | contains("spot") | not) and (.meterName | ascii_downcase | contains("low priority") | not) and (.productName | ascii_downcase | contains("windows") | not)) | .unitPrice')
+                  if [[ -n "$old_vm_price" && "$old_vm_price" != "null" ]]; then
+                    old_vm_monthly=$(awk -v p="$old_vm_price" -v h="$HOURS_PER_MONTH" -v n="$old_node_count" 'BEGIN { printf "%.2f", p * h * n }')
+                  fi
+                fi
+              fi
+
+              add_estimate_with_optional_delta "$action" "$address" "${vm_monthly#£}" "$old_vm_monthly" "${vm_size} x ${node_count}" "AKS node pool estimate based on Linux VM retail price (£$vm_price/hour) for ${node_count} node(s) of ${vm_size}. Excludes control plane and usage-based extras."
+            else
+              record_unestimated_resource "$action" "$address" "$vm_size" "This resource is not currently supported"
+            fi
+          }
+
           record_cosmos_throughput_resource() {
             local resource_type="$1"
             local resource_name="$2"
@@ -1188,6 +1235,9 @@ jobs:
                 ;;
               azurerm_key_vault)
                 record_key_vault "$resource_type" "$resource_name" "$action"
+                ;;
+              azurerm_kubernetes_cluster)
+                record_kubernetes_cluster "$resource_type" "$resource_name" "$action"
                 ;;
               azurerm_cosmosdb_account)
                 add_zero_cost_resource "$action" "$resource_address" "No direct base charge" "The Cosmos DB account shell is not priced separately here; throughput, storage, and backup charges are estimated from child database or container resources."
@@ -1806,11 +1856,56 @@ jobs:
             const analysis = fs.readFileSync('/tmp/copilot-analysis.md', 'utf8');
             const costImpact = fs.existsSync('/tmp/cost-impact.md') ? fs.readFileSync('/tmp/cost-impact.md', 'utf8') : '';
             const tagValidation = fs.existsSync('/tmp/tag-validation.md') ? fs.readFileSync('/tmp/tag-validation.md', 'utf8') : '';
+
+            const parseCostRows = (markdown) => markdown
+              .split('\n')
+              .filter(line => /^\| \*\*(Added|Modified|Removed)\*\* \|/.test(line))
+              .map(line => {
+                const cells = line.split('|').slice(1, -1).map(cell => cell.trim());
+                return {
+                  action: (cells[0] || '').replace(/\*\*/g, ''),
+                  resource: (cells[1] || '').replace(/`/g, ''),
+                  estimate: cells[2] || '',
+                  sku: cells[3] || '',
+                  notes: cells[4] || ''
+                };
+              });
+
+            const buildDeterministicResourceSummary = (rows) => {
+              const byAction = { Added: [], Modified: [], Removed: [] };
+              for (const row of rows) {
+                if (!byAction[row.action]) continue;
+                const line = `  - \`${row.resource}\`: ${row.sku || 'N/A'}${row.estimate ? ` (${row.estimate})` : ''}.`;
+                byAction[row.action].push(line);
+              }
+
+              const section = [
+                '### 📦 Resource Changes Summary',
+                '- **Added:**',
+                ...(byAction.Added.length ? byAction.Added : ['  - None.']),
+                '- **Modified:**',
+                ...(byAction.Modified.length ? byAction.Modified : ['  - None.']),
+                '- **Removed:**',
+                ...(byAction.Removed.length ? byAction.Removed : ['  - None.'])
+              ];
+
+              return section.join('\n');
+            };
+
+            const deterministicResourceSummary = buildDeterministicResourceSummary(parseCostRows(costImpact));
             const tagSummaryMatch = tagValidation.match(/### Summary[\s\S]*?(?=\n### Missing tags|\n---|$)/);
             const tagSummarySection = tagSummaryMatch ? tagSummaryMatch[0].trim() : '';
             const groupedTagSectionMatch = tagValidation.match(/### Missing tags[\s\S]*?(?=\n---|$)/);
             const groupedTagSection = groupedTagSectionMatch ? groupedTagSectionMatch[0].trim() : '';
             let analysisWithoutCostSection = analysis.replace(/### 💰 Cost Impact Analysis[\s\S]*?(?=\n### |$)/, '').trim();
+
+            if (deterministicResourceSummary) {
+              if (/### 📦 Resource Changes Summary/.test(analysisWithoutCostSection)) {
+                analysisWithoutCostSection = analysisWithoutCostSection.replace(/### 📦 Resource Changes Summary[\s\S]*?(?=\n### |$)/, `${deterministicResourceSummary}\n\n`);
+              } else {
+                analysisWithoutCostSection = `${deterministicResourceSummary}\n\n${analysisWithoutCostSection}`.trim();
+              }
+            }
 
             if (tagSummarySection || groupedTagSection) {
               const deterministicTagCompliance = [

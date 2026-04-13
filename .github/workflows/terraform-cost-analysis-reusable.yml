@@ -661,10 +661,6 @@ jobs:
               echo "$DAYS_PER_MONTH|days"
               return
             fi
-            if [[ "$uom_lower" == *"/month"* || "$uom_lower" == *"1/month"* || "$uom_lower" == "1" ]]; then
-              echo "1|month"
-              return
-            fi
             if [[ "$uom_lower" == *"gb"* ]] || [[ "$meter_lower" == *"data stored"* ]] || [[ "$meter_lower" == *"data retention"* ]] || [[ "$meter_lower" == *"data ingestion"* ]]; then
               case "$rt" in
                 azurerm_storage_account)        echo "$STORAGE_ASSUMED_GB_MONTH|GB" ;;
@@ -673,6 +669,10 @@ jobs:
                 azurerm_container_registry)     echo "${CONTAINER_REGISTRY_ASSUMED_GB_MONTH:-10}|GB" ;;
                 *)                              echo "$GENERIC_STORAGE_ASSUMED_GB_MONTH|GB" ;;
               esac
+              return
+            fi
+            if [[ "$uom_lower" == *"/month"* || "$uom_lower" == *"1/month"* || "$uom_lower" == "1" ]]; then
+              echo "1|month"
               return
             fi
             if [[ "$uom_lower" == *"10k"* || "$uom_lower" == *"10,000"* ]] || [[ "$meter_lower" == *"operation"* ]] || [[ "$meter_lower" == *"call"* ]] || [[ "$meter_lower" == *"request"* ]] || [[ "$meter_lower" == *"transaction"* ]]; then

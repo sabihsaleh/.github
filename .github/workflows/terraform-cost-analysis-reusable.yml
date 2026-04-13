@@ -801,6 +801,67 @@ jobs:
             esac
           }
 
+          resource_service_family() {
+            local resource_type="$1"
+            case "$resource_type" in
+              azurerm_container_registry)
+                printf '%s\n' "Containers"
+                ;;
+              azurerm_log_analytics_workspace)
+                printf '%s\n' "Management and Governance"
+                ;;
+              azurerm_key_vault)
+                printf '%s\n' "Security"
+                ;;
+              azurerm_linux_virtual_machine|azurerm_windows_virtual_machine|azurerm_virtual_machine)
+                printf '%s\n' "Compute"
+                ;;
+              azurerm_public_ip|azurerm_application_gateway|azurerm_lb)
+                printf '%s\n' "Networking"
+                ;;
+              azurerm_cosmosdb_account|azurerm_cosmosdb_sql_database|azurerm_cosmosdb_sql_container|azurerm_cosmosdb_mongo_database|azurerm_cosmosdb_mongo_collection)
+                printf '%s\n' "Databases"
+                ;;
+              azurerm_mssql_server|azurerm_mssql_database)
+                printf '%s\n' "Databases"
+                ;;
+              azurerm_storage_account)
+                printf '%s\n' "Storage"
+                ;;
+              azurerm_service_plan|azurerm_linux_web_app|azurerm_windows_web_app)
+                printf '%s\n' "Web"
+                ;;
+              azurerm_redis_cache)
+                printf '%s\n' "Databases"
+                ;;
+              azurerm_servicebus_namespace|azurerm_servicebus_queue|azurerm_servicebus_topic|azurerm_servicebus_subscription)
+                printf '%s\n' "Integration"
+                ;;
+              azurerm_api_management)
+                printf '%s\n' "Integration"
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
+          resource_lookup_filters() {
+            local resource_type="$1"
+            local service_family=""
+            local service_name
+
+            service_family=$(resource_service_family "$resource_type" 2>/dev/null || true)
+            while IFS= read -r service_name; do
+              [[ -z "$service_name" ]] && continue
+              printf '%s|%s\n' "$service_family" "$service_name"
+            done <<< "$(resource_service_aliases "$resource_type")"
+
+            if [[ -n "$service_family" ]]; then
+              printf '%s|\n' "$service_family"
+            fi
+          }
+
           resource_sku_value() {
             local resource_type="$1"
             local resource_name="$2"
@@ -832,6 +893,40 @@ jobs:
 
           base64_decode() {
             printf '%s' "$1" | base64 --decode
+          }
+
+          encode_filter_value() {
+            printf '%s' "$1" | jq -sRr @uri
+          }
+
+          retail_query_from_parts() {
+            local service_family="$1"
+            local service_name="$2"
+            local include_region="$3"
+            local filter_parts=()
+            local filter=""
+            local part
+
+            if [[ -n "$service_family" ]]; then
+              filter_parts+=("serviceFamily%20eq%20'$(encode_filter_value "$service_family")'")
+            fi
+
+            if [[ -n "$service_name" ]]; then
+              filter_parts+=("serviceName%20eq%20'$(encode_filter_value "$service_name")'")
+            fi
+
+            if [[ "$include_region" == "true" ]]; then
+              filter_parts+=("armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'")
+            fi
+
+            for part in "${filter_parts[@]}"; do
+              if [[ -n "$filter" ]]; then
+                filter+="%20and%20"
+              fi
+              filter+="$part"
+            done
+
+            retail_query "$filter"
           }
 
           select_generic_pricing_item() {
@@ -932,19 +1027,54 @@ jobs:
             printf '|%s|%s' "$quantity" "$usage_unit" >&2
           }
 
+          staged_generic_retail_query() {
+            local service_family="$1"
+            local service_name="$2"
+            local json_input=""
+
+            if [[ -n "$service_family" || -n "$service_name" ]]; then
+              json_input=$(retail_query_from_parts "$service_family" "$service_name" true)
+              if [[ $(echo "$json_input" | jq '.Items | length' 2>/dev/null) -gt 0 ]]; then
+                printf '%s' "$json_input"
+                return 0
+              fi
+
+              if [[ -n "$service_name" ]]; then
+                json_input=$(retail_query_from_parts "" "$service_name" true)
+                if [[ $(echo "$json_input" | jq '.Items | length' 2>/dev/null) -gt 0 ]]; then
+                  printf '%s' "$json_input"
+                  return 0
+                fi
+              fi
+
+              if [[ -n "$service_family" ]]; then
+                json_input=$(retail_query_from_parts "$service_family" "" true)
+                if [[ $(echo "$json_input" | jq '.Items | length' 2>/dev/null) -gt 0 ]]; then
+                  printf '%s' "$json_input"
+                  return 0
+                fi
+              fi
+            fi
+
+            return 1
+          }
+
           record_generic_retail_estimate() {
             local resource_type="$1"
             local resource_name="$2"
             local action="$3"
             local address="$resource_type.$resource_name"
-            local sku_value aliases service_name service_json selected_item decoded_item unit_price meter_name unit_of_measure monthly_amount quantity_info quantity usage_unit notes old_sku old_service_json old_selected_item old_decoded_item old_unit_price old_meter_name old_unit_of_measure old_monthly_amount
+            local sku_value filter_line service_family service_name service_json selected_item decoded_item unit_price meter_name unit_of_measure monthly_amount quantity_info quantity usage_unit notes old_sku old_selected_item old_decoded_item old_unit_price old_monthly_amount lookup_label
 
-            sku_value=$(resource_sku_value "$resource_type" "$resource_name") || return 1
-            aliases=$(resource_service_aliases "$resource_type")
+            sku_value=$(resource_sku_value "$resource_type" "$resource_name" 2>/dev/null || true)
+            if [[ -z "$sku_value" ]]; then
+              record_unestimated_resource "$action" "$address" "$resource_type" "Resource was detected, but the estimator could not find a SKU, tier, or size attribute to query against Azure Retail Prices. This resource is not currently supported by the generic pricing API lookup."
+              return 0
+            fi
 
-            while IFS= read -r service_name; do
-              [[ -z "$service_name" ]] && continue
-              service_json=$(retail_query "serviceName%20eq%20'$(printf '%s' "$service_name" | jq -sRr @uri)'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'")
+            while IFS='|' read -r service_family service_name; do
+              [[ -z "$service_family" && -z "$service_name" ]] && continue
+              service_json=$(staged_generic_retail_query "$service_family" "$service_name") || continue
               selected_item=$(select_generic_pricing_item "$service_json" "$sku_value")
               [[ -z "$selected_item" || "$selected_item" == "null" ]] && continue
 
@@ -955,22 +1085,22 @@ jobs:
 
               [[ -z "$unit_price" || "$unit_price" == "null" ]] && continue
 
-              quantity_info=$(quantity_for_generic_meter "$service_name" "$unit_of_measure" "$meter_name") || continue
+              lookup_label="$service_name"
+              [[ -z "$lookup_label" ]] && lookup_label="$service_family"
+
+              quantity_info=$(quantity_for_generic_meter "$lookup_label" "$unit_of_measure" "$meter_name") || continue
               quantity=${quantity_info%%|*}
               usage_unit=${quantity_info#*|}
               monthly_amount=$(awk -v p="$unit_price" -v q="$quantity" 'BEGIN { printf "%.2f", p * q }')
-              append_price_row "$resource_type" "$meter_name" "£$unit_price" "$unit_of_measure" "£$monthly_amount" "Generic fallback matched service $service_name with assumed ${quantity} ${usage_unit}."
+              append_price_row "$resource_type" "$meter_name" "£$unit_price" "$unit_of_measure" "£$monthly_amount" "Generic staged lookup matched ${lookup_label} with assumed ${quantity} ${usage_unit}."
 
               if [[ "$action" == "Modified" ]]; then
                 old_sku=$(resource_sku_value_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" 2>/dev/null || true)
                 if [[ -n "$old_sku" ]]; then
-                  old_service_json=$(retail_query "serviceName%20eq%20'$(printf '%s' "$service_name" | jq -sRr @uri)'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'")
-                  old_selected_item=$(select_generic_pricing_item "$old_service_json" "$old_sku")
+                  old_selected_item=$(select_generic_pricing_item "$service_json" "$old_sku")
                   if [[ -n "$old_selected_item" && "$old_selected_item" != "null" ]]; then
                     old_decoded_item=$(base64_decode "$old_selected_item")
                     old_unit_price=$(echo "$old_decoded_item" | jq -r '.unitPrice')
-                    old_meter_name=$(echo "$old_decoded_item" | jq -r '.meterName')
-                    old_unit_of_measure=$(echo "$old_decoded_item" | jq -r '.unitOfMeasure')
                     if [[ -n "$old_unit_price" && "$old_unit_price" != "null" ]]; then
                       old_monthly_amount=$(awk -v p="$old_unit_price" -v q="$quantity" 'BEGIN { printf "%.2f", p * q }')
                     fi
@@ -978,12 +1108,13 @@ jobs:
                 fi
               fi
 
-              notes="Generic Azure Retail Prices fallback using service ${service_name}, meter ${meter_name}, and assumed ${quantity} ${usage_unit}."
+              notes="Generic Azure Retail Prices staged lookup using ${lookup_label}, meter ${meter_name}, and assumed ${quantity} ${usage_unit}."
               add_estimate_with_optional_delta "$action" "$address" "$monthly_amount" "$old_monthly_amount" "$sku_value" "$notes"
               return 0
-            done <<< "$aliases"
+            done < <(resource_lookup_filters "$resource_type")
 
-            return 1
+            record_unestimated_resource "$action" "$address" "$resource_type" "Resource was detected dynamically, but Azure Retail Prices does not currently expose a confident supported pricing match for this resource type and SKU. This resource is currently unsupported by the estimator."
+            return 0
           }
 
           echo "### Live Retail Prices" >> /tmp/azure-pricing.md
@@ -1046,9 +1177,7 @@ jobs:
                 add_zero_cost_resource "$action" "$resource_address" "No direct base charge" "The resource group itself does not incur a direct Azure usage charge."
                 ;;
               *)
-                if ! record_generic_retail_estimate "$resource_type" "$resource_name" "$action"; then
-                  record_unestimated_resource "$action" "$resource_address" "$resource_type" "Resource detected dynamically, but no pricing handler or generic Retail Prices fallback matched this Azure resource type yet."
-                fi
+                record_generic_retail_estimate "$resource_type" "$resource_name" "$action"
                 ;;
             esac
           done < <(resource_inventory)

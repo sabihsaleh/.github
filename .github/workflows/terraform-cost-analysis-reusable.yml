@@ -1767,6 +1767,8 @@ jobs:
             const analysis = fs.readFileSync('/tmp/copilot-analysis.md', 'utf8');
             const costImpact = fs.existsSync('/tmp/cost-impact.md') ? fs.readFileSync('/tmp/cost-impact.md', 'utf8') : '';
             const tagValidation = fs.existsSync('/tmp/tag-validation.md') ? fs.readFileSync('/tmp/tag-validation.md', 'utf8') : '';
+            const tagSummaryMatch = tagValidation.match(/### Summary[\s\S]*?(?=\n### Missing Tags Grouped by Tag|\n---|$)/);
+            const tagSummarySection = tagSummaryMatch ? tagSummaryMatch[0].trim() : '';
             const groupedTagSectionMatch = tagValidation.match(/### Missing Tags Grouped by Tag[\s\S]*?(?=\n---|$)/);
             const groupedTagSection = groupedTagSectionMatch ? groupedTagSectionMatch[0].trim() : '';
             const analysisWithoutCostSection = analysis.replace(/### 💰 Cost Impact Analysis[\s\S]*?(?=\n### |$)/, '').trim();
@@ -1777,10 +1779,12 @@ jobs:
 
             ` : ''}${analysisWithoutCostSection}
 
-            ${groupedTagSection ? `
+            ${(tagSummarySection || groupedTagSection) ? `
             ---
 
-            ${groupedTagSection}
+            ${tagSummarySection ? `${tagSummarySection}
+
+            ` : ''}${groupedTagSection}
             ` : ''}
 
             ---

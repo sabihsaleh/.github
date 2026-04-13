@@ -1393,44 +1393,19 @@ jobs:
               ].join('\n');
             };
             
-            const prompt = `Azure Cost Optimization: analyse these Terraform changes for ${process.env.AZURE_REGION}. Date: ${workflowDate}. Use LIVE PRICING rows verbatim. Report in GBP.
-
-## RULES
-- Use live retail pricing rows verbatim; do not invent numbers.
-- For usage-based resources, state the unit price and assumption.
-- Do not cite years like 2023.
-
-## TERRAFORM PLAN
-${truncate(tfPlan)}
-
-## DIFF
-${truncate(diffContent)}
-
-## LIVE PRICING
-${truncate(azurePricing)}
-
-## COST IMPACT (deterministic)
-${truncate(costImpact)}
-
-## ADVISOR
-${truncate(azureAdvisor)}
-
-## ORPHANED
-${truncate(orphanedResources)}
-
-## TAGS
-${truncate(tagValidation)}
-
-## OUTPUT (use this exact markdown structure)
-### 💰 Cost Impact Analysis
-| Change | Resource | Est. Monthly Cost | Azure SKU/Tier | Notes |
-|--------|----------|-------------------|----------------|-------|
-
-### 📦 Resource Changes Summary
-### 💡 Cost Optimization Recommendations
-### 🏷️ Tag Compliance
-### 🔐 Security & Best Practices
-### ⚡ Quick Wins`;
+            const sections = [
+              `Azure Cost Optimization: analyse Terraform changes for ${process.env.AZURE_REGION}. Date: ${workflowDate}. Use LIVE PRICING rows verbatim. Report in GBP.`,
+              'RULES: Use live retail pricing rows verbatim. For usage-based resources state the unit price and assumption. Do not cite years like 2023.',
+              `TERRAFORM PLAN:\n${truncate(tfPlan)}`,
+              `DIFF:\n${truncate(diffContent)}`,
+              `LIVE PRICING:\n${truncate(azurePricing)}`,
+              `COST IMPACT:\n${truncate(costImpact)}`,
+              `ADVISOR:\n${truncate(azureAdvisor)}`,
+              `ORPHANED:\n${truncate(orphanedResources)}`,
+              `TAGS:\n${truncate(tagValidation)}`,
+              'OUTPUT FORMAT: ### Cost Impact Analysis (table with Change/Resource/Est Monthly Cost/Azure SKU/Notes), ### Resource Changes Summary, ### Cost Optimization Recommendations, ### Tag Compliance, ### Security & Best Practices, ### Quick Wins'
+            ].join('\n\n');
+            const prompt = sections;
 
             try {
               const response = await fetch('https://models.inference.ai.azure.com/chat/completions', {

@@ -1411,6 +1411,7 @@ jobs:
           echo "" >> /tmp/tag-validation.md
           echo "**Required Tags:** ${REQUIRED_TAGS[*]}" >> /tmp/tag-validation.md
           echo "" >> /tmp/tag-validation.md
+          : > /tmp/tag-missing-pairs.txt
           
           MISSING_TAGS=0
           RESOURCES_CHECKED=0
@@ -1432,6 +1433,11 @@ jobs:
                   echo "**File:** \`$file\` | **Issue:** No tags block" >> /tmp/tag-validation.md
                   echo "" >> /tmp/tag-validation.md
                   MISSING_TAGS=$((MISSING_TAGS + ${#REQUIRED_TAGS[@]}))
+                  for required_tag in "${REQUIRED_TAGS[@]}"; do
+                    required_tag=$(trim "$required_tag")
+                    [[ -z "$required_tag" ]] && continue
+                    echo "${required_tag}|${resource_type}.${resource_name}" >> /tmp/tag-missing-pairs.txt
+                  done
                 else
                   defined_tags=$(collect_defined_tags "$block_content" "$file")
                   missing_for_resource=()
@@ -1449,11 +1455,33 @@ jobs:
                     echo "**File:** \`$file\` | **Missing Tags:** ${missing_for_resource[*]}" >> /tmp/tag-validation.md
                     echo "" >> /tmp/tag-validation.md
                     MISSING_TAGS=$((MISSING_TAGS + ${#missing_for_resource[@]}))
+                    for missing_tag in "${missing_for_resource[@]}"; do
+                      echo "${missing_tag}|${resource_type}.${resource_name}" >> /tmp/tag-missing-pairs.txt
+                    done
                   fi
                 fi
               fi
             done <<< "$(grep -n "^resource \"azurerm_" "$file" 2>/dev/null || true)"
           done
+
+          echo "### Missing Tags Grouped by Tag" >> /tmp/tag-validation.md
+          if [[ -s /tmp/tag-missing-pairs.txt ]]; then
+            for required_tag in "${REQUIRED_TAGS[@]}"; do
+              required_tag=$(trim "$required_tag")
+              [[ -z "$required_tag" ]] && continue
+              resources_for_tag=$(awk -F'|' -v tag="$required_tag" '$1 == tag {print $2}' /tmp/tag-missing-pairs.txt | sort -u)
+              if [[ -n "$resources_for_tag" ]]; then
+                echo "- **${required_tag}:**" >> /tmp/tag-validation.md
+                while IFS= read -r resource_entry; do
+                  [[ -z "$resource_entry" ]] && continue
+                  echo "  - \`${resource_entry}\`" >> /tmp/tag-validation.md
+                done <<< "$resources_for_tag"
+              fi
+            done
+          else
+            echo "- None" >> /tmp/tag-validation.md
+          fi
+          echo "" >> /tmp/tag-validation.md
           
           echo "---" >> /tmp/tag-validation.md
           echo "| Resources Checked | $RESOURCES_CHECKED | Missing Tags | $MISSING_TAGS |" >> /tmp/tag-validation.md
@@ -1717,10 +1745,12 @@ jobs:
         with:
           script: |
             const fs = require('fs');
+            const commentMarker = '<!-- azure-cost-analysis-comment -->';
             const analysis = fs.readFileSync('/tmp/copilot-analysis.md', 'utf8');
             const costImpact = fs.existsSync('/tmp/cost-impact.md') ? fs.readFileSync('/tmp/cost-impact.md', 'utf8') : '';
             const analysisWithoutCostSection = analysis.replace(/### 💰 Cost Impact Analysis[\s\S]*?(?=\n### |$)/, '').trim();
-            const body = `## 🤖 Azure Cost Analysis by GitHub Copilot
+            const body = `${commentMarker}
+            ## 🤖 Azure Cost Analysis by GitHub Copilot
 
             ${costImpact ? `${costImpact}
 
@@ -1740,7 +1770,10 @@ jobs:
               });
               
               const botComment = comments.find(c => 
-                c.user.type === 'Bot' && c.body.includes('Azure Cost Analysis by GitHub Copilot')
+                c.user.type === 'Bot' && (
+                  c.body.includes(commentMarker) ||
+                  c.body.includes('Azure Cost Analysis by GitHub Copilot')
+                )
               );
               
               const commentParams = {

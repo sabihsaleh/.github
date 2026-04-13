@@ -184,6 +184,7 @@ jobs:
           CONTAINER_REGISTRY_ASSUMED_GB_MONTH=50
           SERVICE_BUS_BASIC_ASSUMED_OPERATIONS_MILLIONS=5
           APIM_CONSUMPTION_ASSUMED_10K_CALLS=100
+          KEY_VAULT_ASSUMED_10K_OPERATIONS=1
           GENERIC_STORAGE_ASSUMED_GB_MONTH=50
           GENERIC_10K_UNITS_ASSUMED_PER_MONTH=100
           COSMOS_ASSUMED_RU_PER_SEC=400
@@ -718,6 +719,41 @@ jobs:
             fi
           }
 
+          record_key_vault() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local action="$3"
+            local address="$resource_type.$resource_name"
+            local kv_sku kv_sku_normalized kv_json kv_price kv_meter kv_unit kv_monthly old_kv_sku old_kv_json old_kv_price old_kv_monthly
+
+            kv_sku=$(tf_attr_for_address "$resource_type" "$resource_name" "sku_name")
+            kv_sku_normalized=$(echo "${kv_sku:-standard}" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}')
+
+            kv_json=$(retail_query "serviceName%20eq%20'Key%20Vault'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20skuName%20eq%20'${kv_sku_normalized}'")
+            kv_price=$(first_matching_field "$kv_json" '.Items[] | select(.type == "Consumption" and (.meterName | ascii_downcase | contains("operations")) and (.meterName | ascii_downcase | contains("advanced") | not)) | .unitPrice')
+            kv_meter=$(first_matching_field "$kv_json" '.Items[] | select(.type == "Consumption" and (.meterName | ascii_downcase | contains("operations")) and (.meterName | ascii_downcase | contains("advanced") | not)) | .meterName')
+            kv_unit=$(first_matching_field "$kv_json" '.Items[] | select(.type == "Consumption" and (.meterName | ascii_downcase | contains("operations")) and (.meterName | ascii_downcase | contains("advanced") | not)) | .unitOfMeasure')
+
+            if [[ -n "$kv_price" && "$kv_price" != "null" ]]; then
+              kv_monthly=$(awk -v p="$kv_price" -v u="$KEY_VAULT_ASSUMED_10K_OPERATIONS" 'BEGIN { printf "£%.2f", p * u }')
+              append_price_row "$resource_type" "$kv_meter" "£$kv_price" "$kv_unit" "$kv_monthly" "Assumes ${KEY_VAULT_ASSUMED_10K_OPERATIONS} unit(s) of 10K Key Vault operations per month."
+
+              if [[ "$action" == "Modified" ]]; then
+                old_kv_sku=$(tf_attr_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" "sku_name")
+                old_kv_sku=$(echo "${old_kv_sku:-standard}" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}')
+                old_kv_json=$(retail_query "serviceName%20eq%20'Key%20Vault'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20skuName%20eq%20'${old_kv_sku}'")
+                old_kv_price=$(first_matching_field "$old_kv_json" '.Items[] | select(.type == "Consumption" and (.meterName | ascii_downcase | contains("operations")) and (.meterName | ascii_downcase | contains("advanced") | not)) | .unitPrice')
+                if [[ -n "$old_kv_price" && "$old_kv_price" != "null" ]]; then
+                  old_kv_monthly=$(awk -v p="$old_kv_price" -v u="$KEY_VAULT_ASSUMED_10K_OPERATIONS" 'BEGIN { printf "%.2f", p * u }')
+                fi
+              fi
+
+              add_estimate_with_optional_delta "$action" "$address" "${kv_monthly#£}" "$old_kv_monthly" "$kv_sku_normalized" "Transaction-based estimate from Key Vault Operations meter. Assumes ${KEY_VAULT_ASSUMED_10K_OPERATIONS} unit(s) of 10K operations per month."
+            else
+              record_unestimated_resource "$action" "$address" "$kv_sku_normalized" "This resource is not currently supported"
+            fi
+          }
+
           record_cosmos_throughput_resource() {
             local resource_type="$1"
             local resource_name="$2"
@@ -1149,6 +1185,9 @@ jobs:
                 ;;
               azurerm_application_insights)
                 record_application_insights "$resource_type" "$resource_name" "$action"
+                ;;
+              azurerm_key_vault)
+                record_key_vault "$resource_type" "$resource_name" "$action"
                 ;;
               azurerm_cosmosdb_account)
                 add_zero_cost_resource "$action" "$resource_address" "No direct base charge" "The Cosmos DB account shell is not priced separately here; throughput, storage, and backup charges are estimated from child database or container resources."

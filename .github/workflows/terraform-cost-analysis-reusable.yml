@@ -1730,26 +1730,34 @@ jobs:
             <sub>📊 **Analysis Details:** TF Directory: \`${{ inputs.terraform_directory }}\` | Region: \`${{ inputs.azure_region }}\` | Model: \`${{ inputs.ai_model }}\`</sub>
             <sub>🔧 **Data Sources:** Azure Resource Graph, Azure Advisor, Azure Cost Management, Terraform Plan</sub>`;
             
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
+            const prNumber = context.issue.number || context.payload.pull_request?.number;
             
-            const botComment = comments.find(c => 
-              c.user.type === 'Bot' && c.body.includes('Azure Cost Analysis by GitHub Copilot')
-            );
-            
-            const commentParams = {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: body
-            };
-            
-            if (botComment) {
-              await github.rest.issues.updateComment({ ...commentParams, comment_id: botComment.id });
+            if (prNumber) {
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+              });
+              
+              const botComment = comments.find(c => 
+                c.user.type === 'Bot' && c.body.includes('Azure Cost Analysis by GitHub Copilot')
+              );
+              
+              const commentParams = {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              };
+              
+              if (botComment) {
+                await github.rest.issues.updateComment({ ...commentParams, comment_id: botComment.id });
+              } else {
+                await github.rest.issues.createComment({ ...commentParams, issue_number: prNumber });
+              }
             } else {
-              await github.rest.issues.createComment({ ...commentParams, issue_number: context.issue.number });
+              // No PR context (e.g. workflow_dispatch) — write to job summary instead
+              await core.summary.addRaw(body).write();
+              console.log('No PR found — analysis written to job summary.');
             }
 
       - name: Azure Logout

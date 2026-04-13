@@ -1069,7 +1069,7 @@ jobs:
 
             sku_value=$(resource_sku_value "$resource_type" "$resource_name" 2>/dev/null || true)
             if [[ -z "$sku_value" ]]; then
-              record_unestimated_resource "$action" "$address" "$resource_type" "Resource was detected, but the estimator could not find a SKU, tier, or size attribute to query against Azure Retail Prices. This resource is not currently supported by the generic pricing API lookup."
+              record_unestimated_resource "$action" "$address" "$resource_type" "This resource is not currently supported"
               return 0
             fi
 
@@ -1114,7 +1114,7 @@ jobs:
               return 0
             done < <(resource_lookup_filters "$resource_type")
 
-            record_unestimated_resource "$action" "$address" "$resource_type" "Resource was detected dynamically, but Azure Retail Prices does not currently expose a confident supported pricing match for this resource type and SKU. This resource is currently unsupported by the estimator."
+            record_unestimated_resource "$action" "$address" "$resource_type" "This resource is not currently supported"
             return 0
           }
 
@@ -1463,6 +1463,24 @@ jobs:
               fi
             done <<< "$(grep -n "^resource \"azurerm_" "$file" 2>/dev/null || true)"
           done
+
+          RESOURCES_MISSING_TAGS=0
+          COMMON_MISSING_TAGS=""
+          if [[ -s /tmp/tag-missing-pairs.txt ]]; then
+            RESOURCES_MISSING_TAGS=$(awk -F'|' '{print $2}' /tmp/tag-missing-pairs.txt | sort -u | sed '/^$/d' | wc -l | tr -d ' ')
+            COMMON_MISSING_TAGS=$(awk -F'|' '{print $1}' /tmp/tag-missing-pairs.txt | sort -u | paste -sd ', ' -)
+          fi
+
+          echo "### Summary" >> /tmp/tag-validation.md
+          echo "" >> /tmp/tag-validation.md
+          echo "Resources Missing Tags: $RESOURCES_MISSING_TAGS" >> /tmp/tag-validation.md
+          echo "Total Missing Tags: $MISSING_TAGS" >> /tmp/tag-validation.md
+          if [[ -n "$COMMON_MISSING_TAGS" ]]; then
+            echo "Common Missing Tags: $COMMON_MISSING_TAGS" >> /tmp/tag-validation.md
+          else
+            echo "Common Missing Tags: None" >> /tmp/tag-validation.md
+          fi
+          echo "" >> /tmp/tag-validation.md
 
           echo "### Missing Tags Grouped by Tag" >> /tmp/tag-validation.md
           if [[ -s /tmp/tag-missing-pairs.txt ]]; then

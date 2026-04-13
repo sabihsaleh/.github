@@ -95,7 +95,7 @@ jobs:
       - name: Checkout base branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.ref }}
+          ref: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch || 'main' }}
           path: base
 
       - name: Setup Terraform
@@ -129,9 +129,10 @@ jobs:
         if: steps.check_files.outputs.has_tf_files == 'true'
         id: changed_files
         run: |
-          CHANGED_FILES=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }} -- '*.tf' '*.tfvars' | tr '\n' ' ')
+          BASE_REF="${{ github.event.pull_request.base.ref || github.event.repository.default_branch || 'main' }}"
+          CHANGED_FILES=$(git diff --name-only origin/${BASE_REF} -- '*.tf' '*.tfvars' | tr '\n' ' ')
           echo "files=$CHANGED_FILES" >> $GITHUB_OUTPUT
-          git diff origin/${{ github.event.pull_request.base.ref }} -- '*.tf' '*.tfvars' > /tmp/terraform-diff.txt
+          git diff origin/${BASE_REF} -- '*.tf' '*.tfvars' > /tmp/terraform-diff.txt
 
       - name: Collect Terraform Content
         if: steps.check_files.outputs.has_tf_files == 'true'

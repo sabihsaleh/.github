@@ -1,6 +1,5 @@
 # Reusable Terraform Cost Analysis Workflow using Azure Native Tools + GitHub Copilot
 # Uses: Azure CLI, Azure Cost Management, Azure Resource Graph, Azure Advisor
-# NO Infracost required!
 #
 # Usage in other repos:
 #   jobs:
@@ -95,7 +94,7 @@ jobs:
       - name: Checkout base branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.ref }}
+          ref: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch || 'main' }}
           path: base
 
       - name: Setup Terraform
@@ -129,9 +128,10 @@ jobs:
         if: steps.check_files.outputs.has_tf_files == 'true'
         id: changed_files
         run: |
-          CHANGED_FILES=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }} -- '*.tf' '*.tfvars' | tr '\n' ' ')
+          BASE_REF="${{ github.event.pull_request.base.ref || github.event.repository.default_branch || 'main' }}"
+          CHANGED_FILES=$(git diff --name-only origin/${BASE_REF} -- '*.tf' '*.tfvars' | tr '\n' ' ')
           echo "files=$CHANGED_FILES" >> $GITHUB_OUTPUT
-          git diff origin/${{ github.event.pull_request.base.ref }} -- '*.tf' '*.tfvars' > /tmp/terraform-diff.txt
+          git diff origin/${BASE_REF} -- '*.tf' '*.tfvars' > /tmp/terraform-diff.txt
 
       - name: Collect Terraform Content
         if: steps.check_files.outputs.has_tf_files == 'true'
@@ -179,8 +179,15 @@ jobs:
           HAS_GAPS=0
           STORAGE_ASSUMED_GB_MONTH=756
           APP_INSIGHTS_ASSUMED_GB_MONTH=30
+          LOG_ANALYTICS_ASSUMED_GB_MONTH=30
+          CONTAINER_REGISTRY_ASSUMED_GB_MONTH=50
           SERVICE_BUS_BASIC_ASSUMED_OPERATIONS_MILLIONS=5
           APIM_CONSUMPTION_ASSUMED_10K_CALLS=100
+          KEY_VAULT_ASSUMED_10K_OPERATIONS=1
+          AKS_DEFAULT_NODE_COUNT=1
+          GENERIC_STORAGE_ASSUMED_GB_MONTH=50
+          GENERIC_10K_UNITS_ASSUMED_PER_MONTH=100
+          COSMOS_ASSUMED_RU_PER_SEC=400
 
           tf_attr_in_dir() {
             local dir_path="$1"
@@ -712,6 +719,487 @@ jobs:
             fi
           }
 
+          record_key_vault() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local action="$3"
+            local address="$resource_type.$resource_name"
+            local kv_sku kv_sku_normalized kv_json kv_price kv_meter kv_unit kv_monthly old_kv_sku old_kv_json old_kv_price old_kv_monthly
+
+            kv_sku=$(tf_attr_for_address "$resource_type" "$resource_name" "sku_name")
+            kv_sku_normalized=$(echo "${kv_sku:-standard}" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}')
+
+            kv_json=$(retail_query "serviceName%20eq%20'Key%20Vault'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20skuName%20eq%20'${kv_sku_normalized}'")
+            kv_price=$(first_matching_field "$kv_json" '.Items[] | select(.type == "Consumption" and (.meterName | ascii_downcase | contains("operations")) and (.meterName | ascii_downcase | contains("advanced") | not)) | .unitPrice')
+            kv_meter=$(first_matching_field "$kv_json" '.Items[] | select(.type == "Consumption" and (.meterName | ascii_downcase | contains("operations")) and (.meterName | ascii_downcase | contains("advanced") | not)) | .meterName')
+            kv_unit=$(first_matching_field "$kv_json" '.Items[] | select(.type == "Consumption" and (.meterName | ascii_downcase | contains("operations")) and (.meterName | ascii_downcase | contains("advanced") | not)) | .unitOfMeasure')
+
+            if [[ -n "$kv_price" && "$kv_price" != "null" ]]; then
+              kv_monthly=$(awk -v p="$kv_price" -v u="$KEY_VAULT_ASSUMED_10K_OPERATIONS" 'BEGIN { printf "£%.2f", p * u }')
+              append_price_row "$resource_type" "$kv_meter" "£$kv_price" "$kv_unit" "$kv_monthly" "Assumes ${KEY_VAULT_ASSUMED_10K_OPERATIONS} unit(s) of 10K Key Vault operations per month."
+
+              if [[ "$action" == "Modified" ]]; then
+                old_kv_sku=$(tf_attr_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" "sku_name")
+                old_kv_sku=$(echo "${old_kv_sku:-standard}" | awk '{print toupper(substr($0,1,1)) tolower(substr($0,2))}')
+                old_kv_json=$(retail_query "serviceName%20eq%20'Key%20Vault'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20skuName%20eq%20'${old_kv_sku}'")
+                old_kv_price=$(first_matching_field "$old_kv_json" '.Items[] | select(.type == "Consumption" and (.meterName | ascii_downcase | contains("operations")) and (.meterName | ascii_downcase | contains("advanced") | not)) | .unitPrice')
+                if [[ -n "$old_kv_price" && "$old_kv_price" != "null" ]]; then
+                  old_kv_monthly=$(awk -v p="$old_kv_price" -v u="$KEY_VAULT_ASSUMED_10K_OPERATIONS" 'BEGIN { printf "%.2f", p * u }')
+                fi
+              fi
+
+              add_estimate_with_optional_delta "$action" "$address" "${kv_monthly#£}" "$old_kv_monthly" "$kv_sku_normalized" "Transaction-based estimate from Key Vault Operations meter. Assumes ${KEY_VAULT_ASSUMED_10K_OPERATIONS} unit(s) of 10K operations per month."
+            else
+              record_unestimated_resource "$action" "$address" "$kv_sku_normalized" "This resource is not currently supported"
+            fi
+          }
+
+          record_kubernetes_cluster() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local action="$3"
+            local address="$resource_type.$resource_name"
+            local vm_size node_count aks_json vm_price vm_meter vm_unit vm_monthly old_vm_size old_node_count old_aks_json old_vm_price old_vm_monthly
+
+            vm_size=$(tf_attr_for_address "$resource_type" "$resource_name" "vm_size")
+            node_count=$(tf_attr_for_address "$resource_type" "$resource_name" "node_count")
+
+            [[ -z "$node_count" || "$node_count" == "null" ]] && node_count=$AKS_DEFAULT_NODE_COUNT
+
+            if [[ -z "$vm_size" || "$vm_size" == "null" ]]; then
+              record_unestimated_resource "$action" "$address" "AKS" "This resource is not currently supported"
+              return
+            fi
+
+            aks_json=$(retail_query "serviceName%20eq%20'Virtual%20Machines'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20armSkuName%20eq%20'${vm_size}'")
+            vm_price=$(first_matching_field "$aks_json" '.Items[] | select(.type == "Consumption" and (.unitOfMeasure | ascii_downcase | contains("hour")) and (.meterName | ascii_downcase | contains("spot") | not) and (.meterName | ascii_downcase | contains("low priority") | not) and (.productName | ascii_downcase | contains("windows") | not)) | .unitPrice')
+            vm_meter=$(first_matching_field "$aks_json" '.Items[] | select(.type == "Consumption" and (.unitOfMeasure | ascii_downcase | contains("hour")) and (.meterName | ascii_downcase | contains("spot") | not) and (.meterName | ascii_downcase | contains("low priority") | not) and (.productName | ascii_downcase | contains("windows") | not)) | .meterName')
+            vm_unit=$(first_matching_field "$aks_json" '.Items[] | select(.type == "Consumption" and (.unitOfMeasure | ascii_downcase | contains("hour")) and (.meterName | ascii_downcase | contains("spot") | not) and (.meterName | ascii_downcase | contains("low priority") | not) and (.productName | ascii_downcase | contains("windows") | not)) | .unitOfMeasure')
+
+            if [[ -n "$vm_price" && "$vm_price" != "null" ]]; then
+              vm_monthly=$(awk -v p="$vm_price" -v h="$HOURS_PER_MONTH" -v n="$node_count" 'BEGIN { printf "£%.2f", p * h * n }')
+              append_price_row "$resource_type" "$vm_meter" "£$vm_price" "$vm_unit" "$vm_monthly" "AKS node pool estimate using ${node_count} node(s) of ${vm_size}. Excludes managed disks, load balancer, bandwidth, and optional add-ons."
+
+              if [[ "$action" == "Modified" ]]; then
+                old_vm_size=$(tf_attr_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" "vm_size")
+                old_node_count=$(tf_attr_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" "node_count")
+                [[ -z "$old_node_count" || "$old_node_count" == "null" ]] && old_node_count=$AKS_DEFAULT_NODE_COUNT
+
+                if [[ -n "$old_vm_size" && "$old_vm_size" != "null" ]]; then
+                  old_aks_json=$(retail_query "serviceName%20eq%20'Virtual%20Machines'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20armSkuName%20eq%20'${old_vm_size}'")
+                  old_vm_price=$(first_matching_field "$old_aks_json" '.Items[] | select(.type == "Consumption" and (.unitOfMeasure | ascii_downcase | contains("hour")) and (.meterName | ascii_downcase | contains("spot") | not) and (.meterName | ascii_downcase | contains("low priority") | not) and (.productName | ascii_downcase | contains("windows") | not)) | .unitPrice')
+                  if [[ -n "$old_vm_price" && "$old_vm_price" != "null" ]]; then
+                    old_vm_monthly=$(awk -v p="$old_vm_price" -v h="$HOURS_PER_MONTH" -v n="$old_node_count" 'BEGIN { printf "%.2f", p * h * n }')
+                  fi
+                fi
+              fi
+
+              add_estimate_with_optional_delta "$action" "$address" "${vm_monthly#£}" "$old_vm_monthly" "${vm_size} x ${node_count}" "AKS node pool estimate based on Linux VM retail price (£$vm_price/hour) for ${node_count} node(s) of ${vm_size}. Excludes control plane and usage-based extras."
+            else
+              record_unestimated_resource "$action" "$address" "$vm_size" "This resource is not currently supported"
+            fi
+          }
+
+          record_cosmos_throughput_resource() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local action="$3"
+            local address="$resource_type.$resource_name"
+            local throughput autoscale_throughput ru_units cosmos_json cosmos_price cosmos_meter cosmos_unit cosmos_monthly old_throughput old_autoscale_throughput old_ru_units old_cosmos_monthly assumption_note
+
+            throughput=$(tf_attr_for_address "$resource_type" "$resource_name" "throughput")
+            autoscale_throughput=$(tf_attr_for_address "$resource_type" "$resource_name" "max_throughput")
+
+            if [[ -n "$autoscale_throughput" ]]; then
+              ru_units=$(awk -v t="$autoscale_throughput" 'BEGIN { printf "%.2f", t / 100 }')
+              assumption_note="Uses autoscale max throughput of ${autoscale_throughput} RU/s."
+            elif [[ -n "$throughput" ]]; then
+              ru_units=$(awk -v t="$throughput" 'BEGIN { printf "%.2f", t / 100 }')
+              assumption_note="Uses provisioned throughput of ${throughput} RU/s."
+            else
+              ru_units=$(awk -v t="$COSMOS_ASSUMED_RU_PER_SEC" 'BEGIN { printf "%.2f", t / 100 }')
+              assumption_note="No throughput was declared, so the estimate assumes ${COSMOS_ASSUMED_RU_PER_SEC} RU/s."
+            fi
+
+            cosmos_json=$(retail_query "serviceName%20eq%20'Azure%20Cosmos%20DB%20RUs'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'%20and%20contains(meterName,'100%20RU%2Fs')")
+            cosmos_price=$(first_matching_field "$cosmos_json" '.Items[] | select(.type == "Consumption") | .unitPrice')
+            cosmos_meter=$(first_matching_field "$cosmos_json" '.Items[] | select(.type == "Consumption") | .meterName')
+            cosmos_unit=$(first_matching_field "$cosmos_json" '.Items[] | select(.type == "Consumption") | .unitOfMeasure')
+
+            if [[ -n "$cosmos_price" && "$cosmos_price" != "null" ]]; then
+              cosmos_monthly=$(awk -v p="$cosmos_price" -v h="$HOURS_PER_MONTH" -v ru="$ru_units" 'BEGIN { printf "£%.2f", p * h * ru }')
+              append_price_row "$resource_type" "$cosmos_meter" "£$cosmos_price" "$cosmos_unit" "$cosmos_monthly" "${assumption_note} Monthly estimate is calculated as £$cosmos_price x ${HOURS_PER_MONTH} hours x ${ru_units} units of 100 RU/s."
+
+              if [[ "$action" == "Modified" ]]; then
+                old_throughput=$(tf_attr_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" "throughput")
+                old_autoscale_throughput=$(tf_attr_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" "max_throughput")
+                if [[ -n "$old_autoscale_throughput" ]]; then
+                  old_ru_units=$(awk -v t="$old_autoscale_throughput" 'BEGIN { printf "%.2f", t / 100 }')
+                elif [[ -n "$old_throughput" ]]; then
+                  old_ru_units=$(awk -v t="$old_throughput" 'BEGIN { printf "%.2f", t / 100 }')
+                else
+                  old_ru_units=$(awk -v t="$COSMOS_ASSUMED_RU_PER_SEC" 'BEGIN { printf "%.2f", t / 100 }')
+                fi
+                old_cosmos_monthly=$(awk -v p="$cosmos_price" -v h="$HOURS_PER_MONTH" -v ru="$old_ru_units" 'BEGIN { printf "%.2f", p * h * ru }')
+              fi
+
+              add_estimate_with_optional_delta "$action" "$address" "${cosmos_monthly#£}" "$old_cosmos_monthly" "Cosmos DB Throughput" "$assumption_note Live Azure retail price from meter $cosmos_meter at £$cosmos_price per hour for each 100 RU/s."
+            else
+              record_unestimated_resource "$action" "$address" "Cosmos DB Throughput" "Retail pricing query did not return a usable Cosmos DB RU price row."
+            fi
+          }
+
+          resource_service_aliases() {
+            local resource_type="$1"
+            case "$resource_type" in
+              azurerm_container_registry)
+                printf '%s\n' "Container Registry"
+                ;;
+              azurerm_log_analytics_workspace)
+                printf '%s\n' "Log Analytics"
+                ;;
+              azurerm_key_vault)
+                printf '%s\n' "Key Vault"
+                ;;
+              azurerm_linux_virtual_machine|azurerm_windows_virtual_machine|azurerm_virtual_machine)
+                printf '%s\n' "Virtual Machines"
+                ;;
+              azurerm_public_ip)
+                printf '%s\n' "IP Addresses"
+                ;;
+              azurerm_application_gateway)
+                printf '%s\n' "Application Gateway"
+                ;;
+              azurerm_lb)
+                printf '%s\n' "Load Balancer"
+                ;;
+              azurerm_cosmosdb_account|azurerm_cosmosdb_sql_database|azurerm_cosmosdb_sql_container|azurerm_cosmosdb_mongo_database|azurerm_cosmosdb_mongo_collection)
+                printf '%s\n' "Azure Cosmos DB"
+                ;;
+              *)
+                local derived
+                derived=$(echo "$resource_type" | sed 's/^azurerm_//' | tr '_' ' ' | awk '{for (i=1; i<=NF; i++) {$i=toupper(substr($i,1,1)) tolower(substr($i,2))} print}')
+                printf '%s\n' "$derived" "Azure $derived"
+                ;;
+            esac
+          }
+
+          resource_service_family() {
+            local resource_type="$1"
+            case "$resource_type" in
+              azurerm_container_registry)
+                printf '%s\n' "Containers"
+                ;;
+              azurerm_log_analytics_workspace)
+                printf '%s\n' "Management and Governance"
+                ;;
+              azurerm_key_vault)
+                printf '%s\n' "Security"
+                ;;
+              azurerm_linux_virtual_machine|azurerm_windows_virtual_machine|azurerm_virtual_machine)
+                printf '%s\n' "Compute"
+                ;;
+              azurerm_public_ip|azurerm_application_gateway|azurerm_lb)
+                printf '%s\n' "Networking"
+                ;;
+              azurerm_cosmosdb_account|azurerm_cosmosdb_sql_database|azurerm_cosmosdb_sql_container|azurerm_cosmosdb_mongo_database|azurerm_cosmosdb_mongo_collection)
+                printf '%s\n' "Databases"
+                ;;
+              azurerm_mssql_server|azurerm_mssql_database)
+                printf '%s\n' "Databases"
+                ;;
+              azurerm_storage_account)
+                printf '%s\n' "Storage"
+                ;;
+              azurerm_service_plan|azurerm_linux_web_app|azurerm_windows_web_app)
+                printf '%s\n' "Web"
+                ;;
+              azurerm_redis_cache)
+                printf '%s\n' "Databases"
+                ;;
+              azurerm_servicebus_namespace|azurerm_servicebus_queue|azurerm_servicebus_topic|azurerm_servicebus_subscription)
+                printf '%s\n' "Integration"
+                ;;
+              azurerm_api_management)
+                printf '%s\n' "Integration"
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
+          resource_lookup_filters() {
+            local resource_type="$1"
+            local service_family=""
+            local service_name
+
+            service_family=$(resource_service_family "$resource_type" 2>/dev/null || true)
+            while IFS= read -r service_name; do
+              [[ -z "$service_name" ]] && continue
+              printf '%s|%s\n' "$service_family" "$service_name"
+            done <<< "$(resource_service_aliases "$resource_type")"
+
+            if [[ -n "$service_family" ]]; then
+              printf '%s|\n' "$service_family"
+            fi
+          }
+
+          resource_sku_value() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local sku_value
+            for attr_name in sku_name sku tier service_tier size vm_size; do
+              sku_value=$(tf_attr_for_address "$resource_type" "$resource_name" "$attr_name")
+              if [[ -n "$sku_value" ]]; then
+                printf '%s\n' "$sku_value"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          resource_sku_value_in_dir() {
+            local dir_path="$1"
+            local resource_type="$2"
+            local resource_name="$3"
+            local sku_value
+            for attr_name in sku_name sku tier service_tier size vm_size; do
+              sku_value=$(tf_attr_in_dir "$dir_path" "$resource_type" "$resource_name" "$attr_name")
+              if [[ -n "$sku_value" ]]; then
+                printf '%s\n' "$sku_value"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          base64_decode() {
+            printf '%s' "$1" | base64 --decode
+          }
+
+          encode_filter_value() {
+            printf '%s' "$1" | jq -sRr @uri
+          }
+
+          retail_query_from_parts() {
+            local service_family="$1"
+            local service_name="$2"
+            local include_region="$3"
+            local filter_parts=()
+            local filter=""
+            local part
+
+            if [[ -n "$service_family" ]]; then
+              filter_parts+=("serviceFamily%20eq%20'$(encode_filter_value "$service_family")'")
+            fi
+
+            if [[ -n "$service_name" ]]; then
+              filter_parts+=("serviceName%20eq%20'$(encode_filter_value "$service_name")'")
+            fi
+
+            if [[ "$include_region" == "true" ]]; then
+              filter_parts+=("armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'")
+            fi
+
+            for part in "${filter_parts[@]}"; do
+              if [[ -n "$filter" ]]; then
+                filter+="%20and%20"
+              fi
+              filter+="$part"
+            done
+
+            retail_query "$filter"
+          }
+
+          select_generic_pricing_item() {
+            local json_input="$1"
+            local sku_value="$2"
+            echo "$json_input" | jq -r --arg sku "${sku_value,,}" '
+              [
+                .Items[]
+                | select(.type == "Consumption")
+                | select(((.meterName // "") | ascii_downcase | contains("secondary")) | not)
+                | select(((.productName // "") | ascii_downcase | contains("dev/test")) | not)
+                | select(
+                    ($sku == "") or
+                    (((.skuName // "") | ascii_downcase) == $sku) or
+                    (((.skuName // "") | ascii_downcase) | contains($sku)) or
+                    (((.productName // "") | ascii_downcase) | contains($sku)) or
+                    (((.meterName // "") | ascii_downcase) | contains($sku))
+                  )
+              ]
+              | sort_by(
+                  if ((.unitOfMeasure // "") | ascii_downcase | test("hour")) then 0
+                  elif ((.unitOfMeasure // "") | ascii_downcase | test("/month|month")) then 1
+                  elif ((.unitOfMeasure // "") | ascii_downcase | test("day")) then 2
+                  elif ((.unitOfMeasure // "") | ascii_downcase | test("gb")) then 3
+                  elif ((.unitOfMeasure // "") | ascii_downcase | test("10k")) then 4
+                  else 9
+                  end
+                )
+              | .[0] | @base64
+            ' | head -1
+          }
+
+          quantity_for_generic_meter() {
+            local service_name="$1"
+            local unit_of_measure="$2"
+            local meter_name="$3"
+            local unit_lower meter_lower
+            unit_lower=$(echo "$unit_of_measure" | tr '[:upper:]' '[:lower:]')
+            meter_lower=$(echo "$meter_name" | tr '[:upper:]' '[:lower:]')
+
+            if [[ "$unit_lower" == *"hour"* ]]; then
+              printf '%s|hours' "$HOURS_PER_MONTH"
+              return 0
+            fi
+
+            if [[ "$unit_lower" == *"day"* ]]; then
+              printf '%s|days' "$DAYS_PER_MONTH"
+              return 0
+            fi
+
+            if [[ "$unit_lower" == *"gb/month"* ]] || [[ "$meter_lower" == *"data stored"* ]] || [[ "$meter_lower" == *"data retention"* ]]; then
+              case "$service_name" in
+                "Log Analytics")
+                  printf '%s|GB-Month' "$LOG_ANALYTICS_ASSUMED_GB_MONTH"
+                  ;;
+                "Container Registry")
+                  printf '%s|GB-Month' "$CONTAINER_REGISTRY_ASSUMED_GB_MONTH"
+                  ;;
+                *)
+                  printf '%s|GB-Month' "$GENERIC_STORAGE_ASSUMED_GB_MONTH"
+                  ;;
+              esac
+              return 0
+            fi
+
+            if [[ "$unit_lower" == "1 gb" ]]; then
+              case "$service_name" in
+                "Log Analytics")
+                  printf '%s|GB' "$LOG_ANALYTICS_ASSUMED_GB_MONTH"
+                  return 0
+                  ;;
+              esac
+            fi
+
+            if [[ "$unit_lower" == *"/month"* ]]; then
+              printf '1|month'
+              return 0
+            fi
+
+            if [[ "$unit_lower" == *"10k"* ]] || [[ "$meter_lower" == *"operation"* ]] || [[ "$meter_lower" == *"call"* ]] || [[ "$meter_lower" == *"request"* ]]; then
+              printf '%s|10K units' "$GENERIC_10K_UNITS_ASSUMED_PER_MONTH"
+              return 0
+            fi
+
+            return 1
+          }
+
+          estimate_generic_monthly_amount() {
+            local service_name="$1"
+            local price="$2"
+            local unit_of_measure="$3"
+            local meter_name="$4"
+            local quantity_info quantity usage_unit
+            quantity_info=$(quantity_for_generic_meter "$service_name" "$unit_of_measure" "$meter_name") || return 1
+            quantity=${quantity_info%%|*}
+            usage_unit=${quantity_info#*|}
+            awk -v p="$price" -v q="$quantity" 'BEGIN { printf "%.2f", p * q }'
+            printf '|%s|%s' "$quantity" "$usage_unit" >&2
+          }
+
+          staged_generic_retail_query() {
+            local service_family="$1"
+            local service_name="$2"
+            local json_input=""
+
+            if [[ -n "$service_family" || -n "$service_name" ]]; then
+              json_input=$(retail_query_from_parts "$service_family" "$service_name" true)
+              if [[ $(echo "$json_input" | jq '.Items | length' 2>/dev/null) -gt 0 ]]; then
+                printf '%s' "$json_input"
+                return 0
+              fi
+
+              if [[ -n "$service_name" ]]; then
+                json_input=$(retail_query_from_parts "" "$service_name" true)
+                if [[ $(echo "$json_input" | jq '.Items | length' 2>/dev/null) -gt 0 ]]; then
+                  printf '%s' "$json_input"
+                  return 0
+                fi
+              fi
+
+              if [[ -n "$service_family" ]]; then
+                json_input=$(retail_query_from_parts "$service_family" "" true)
+                if [[ $(echo "$json_input" | jq '.Items | length' 2>/dev/null) -gt 0 ]]; then
+                  printf '%s' "$json_input"
+                  return 0
+                fi
+              fi
+            fi
+
+            return 1
+          }
+
+          record_generic_retail_estimate() {
+            local resource_type="$1"
+            local resource_name="$2"
+            local action="$3"
+            local address="$resource_type.$resource_name"
+            local sku_value filter_line service_family service_name service_json selected_item decoded_item unit_price meter_name unit_of_measure monthly_amount quantity_info quantity usage_unit notes old_sku old_selected_item old_decoded_item old_unit_price old_monthly_amount lookup_label
+
+            sku_value=$(resource_sku_value "$resource_type" "$resource_name" 2>/dev/null || true)
+            if [[ -z "$sku_value" ]]; then
+              record_unestimated_resource "$action" "$address" "$resource_type" "This resource is not currently supported"
+              return 0
+            fi
+
+            while IFS='|' read -r service_family service_name; do
+              [[ -z "$service_family" && -z "$service_name" ]] && continue
+              service_json=$(staged_generic_retail_query "$service_family" "$service_name") || continue
+              selected_item=$(select_generic_pricing_item "$service_json" "$sku_value")
+              [[ -z "$selected_item" || "$selected_item" == "null" ]] && continue
+
+              decoded_item=$(base64_decode "$selected_item")
+              unit_price=$(echo "$decoded_item" | jq -r '.unitPrice')
+              meter_name=$(echo "$decoded_item" | jq -r '.meterName')
+              unit_of_measure=$(echo "$decoded_item" | jq -r '.unitOfMeasure')
+
+              [[ -z "$unit_price" || "$unit_price" == "null" ]] && continue
+
+              lookup_label="$service_name"
+              [[ -z "$lookup_label" ]] && lookup_label="$service_family"
+
+              quantity_info=$(quantity_for_generic_meter "$lookup_label" "$unit_of_measure" "$meter_name") || continue
+              quantity=${quantity_info%%|*}
+              usage_unit=${quantity_info#*|}
+              monthly_amount=$(awk -v p="$unit_price" -v q="$quantity" 'BEGIN { printf "%.2f", p * q }')
+              append_price_row "$resource_type" "$meter_name" "£$unit_price" "$unit_of_measure" "£$monthly_amount" "Generic staged lookup matched ${lookup_label} with assumed ${quantity} ${usage_unit}."
+
+              if [[ "$action" == "Modified" ]]; then
+                old_sku=$(resource_sku_value_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" 2>/dev/null || true)
+                if [[ -n "$old_sku" ]]; then
+                  old_selected_item=$(select_generic_pricing_item "$service_json" "$old_sku")
+                  if [[ -n "$old_selected_item" && "$old_selected_item" != "null" ]]; then
+                    old_decoded_item=$(base64_decode "$old_selected_item")
+                    old_unit_price=$(echo "$old_decoded_item" | jq -r '.unitPrice')
+                    if [[ -n "$old_unit_price" && "$old_unit_price" != "null" ]]; then
+                      old_monthly_amount=$(awk -v p="$old_unit_price" -v q="$quantity" 'BEGIN { printf "%.2f", p * q }')
+                    fi
+                  fi
+                fi
+              fi
+
+              notes="Generic Azure Retail Prices staged lookup using ${lookup_label}, meter ${meter_name}, and assumed ${quantity} ${usage_unit}."
+              add_estimate_with_optional_delta "$action" "$address" "$monthly_amount" "$old_monthly_amount" "$sku_value" "$notes"
+              return 0
+            done < <(resource_lookup_filters "$resource_type")
+
+            record_unestimated_resource "$action" "$address" "$resource_type" "This resource is not currently supported"
+            return 0
+          }
+
           echo "### Live Retail Prices" >> /tmp/azure-pricing.md
           echo "| Resource | Azure Retail Meter | Unit Price | Unit | Monthly Estimate | Notes |" >> /tmp/azure-pricing.md
           echo "|----------|--------------------|------------|------|------------------|-------|" >> /tmp/azure-pricing.md
@@ -744,6 +1232,18 @@ jobs:
               azurerm_application_insights)
                 record_application_insights "$resource_type" "$resource_name" "$action"
                 ;;
+              azurerm_key_vault)
+                record_key_vault "$resource_type" "$resource_name" "$action"
+                ;;
+              azurerm_kubernetes_cluster)
+                record_kubernetes_cluster "$resource_type" "$resource_name" "$action"
+                ;;
+              azurerm_cosmosdb_account)
+                add_zero_cost_resource "$action" "$resource_address" "No direct base charge" "The Cosmos DB account shell is not priced separately here; throughput, storage, and backup charges are estimated from child database or container resources."
+                ;;
+              azurerm_cosmosdb_sql_database|azurerm_cosmosdb_sql_container|azurerm_cosmosdb_mongo_database|azurerm_cosmosdb_mongo_collection)
+                record_cosmos_throughput_resource "$resource_type" "$resource_name" "$action"
+                ;;
               azurerm_api_management)
                 record_api_management "$resource_type" "$resource_name" "$action"
                 ;;
@@ -766,7 +1266,7 @@ jobs:
                 add_zero_cost_resource "$action" "$resource_address" "No direct base charge" "The resource group itself does not incur a direct Azure usage charge."
                 ;;
               *)
-                record_unestimated_resource "$action" "$resource_address" "$resource_type" "Resource detected dynamically, but no pricing handler is configured yet for this Azure resource type."
+                record_generic_retail_estimate "$resource_type" "$resource_name" "$action"
                 ;;
             esac
           done < <(resource_inventory)
@@ -999,6 +1499,7 @@ jobs:
           echo "" >> /tmp/tag-validation.md
           echo "**Required Tags:** ${REQUIRED_TAGS[*]}" >> /tmp/tag-validation.md
           echo "" >> /tmp/tag-validation.md
+          : > /tmp/tag-missing-pairs.txt
           
           MISSING_TAGS=0
           RESOURCES_CHECKED=0
@@ -1020,6 +1521,11 @@ jobs:
                   echo "**File:** \`$file\` | **Issue:** No tags block" >> /tmp/tag-validation.md
                   echo "" >> /tmp/tag-validation.md
                   MISSING_TAGS=$((MISSING_TAGS + ${#REQUIRED_TAGS[@]}))
+                  for required_tag in "${REQUIRED_TAGS[@]}"; do
+                    required_tag=$(trim "$required_tag")
+                    [[ -z "$required_tag" ]] && continue
+                    echo "${required_tag}|${resource_type}.${resource_name}" >> /tmp/tag-missing-pairs.txt
+                  done
                 else
                   defined_tags=$(collect_defined_tags "$block_content" "$file")
                   missing_for_resource=()
@@ -1037,11 +1543,51 @@ jobs:
                     echo "**File:** \`$file\` | **Missing Tags:** ${missing_for_resource[*]}" >> /tmp/tag-validation.md
                     echo "" >> /tmp/tag-validation.md
                     MISSING_TAGS=$((MISSING_TAGS + ${#missing_for_resource[@]}))
+                    for missing_tag in "${missing_for_resource[@]}"; do
+                      echo "${missing_tag}|${resource_type}.${resource_name}" >> /tmp/tag-missing-pairs.txt
+                    done
                   fi
                 fi
               fi
             done <<< "$(grep -n "^resource \"azurerm_" "$file" 2>/dev/null || true)"
           done
+
+          RESOURCES_MISSING_TAGS=0
+          COMMON_MISSING_TAGS=""
+          if [[ -s /tmp/tag-missing-pairs.txt ]]; then
+            RESOURCES_MISSING_TAGS=$(awk -F'|' '{print $2}' /tmp/tag-missing-pairs.txt | sort -u | sed '/^$/d' | wc -l | tr -d ' ')
+            COMMON_MISSING_TAGS=$(awk -F'|' '{print $1}' /tmp/tag-missing-pairs.txt | sort -u | paste -sd ',' - | sed 's/,/, /g')
+          fi
+
+          echo "### Summary" >> /tmp/tag-validation.md
+          echo "" >> /tmp/tag-validation.md
+          echo "Resources Missing Tags: $RESOURCES_MISSING_TAGS" >> /tmp/tag-validation.md
+          echo "Total Missing Tags: $MISSING_TAGS" >> /tmp/tag-validation.md
+          if [[ -n "$COMMON_MISSING_TAGS" ]]; then
+            echo "Common Missing Tags: $COMMON_MISSING_TAGS" >> /tmp/tag-validation.md
+          else
+            echo "Common Missing Tags: None" >> /tmp/tag-validation.md
+          fi
+          echo "" >> /tmp/tag-validation.md
+
+          echo "### Missing tags" >> /tmp/tag-validation.md
+          if [[ -s /tmp/tag-missing-pairs.txt ]]; then
+            for required_tag in "${REQUIRED_TAGS[@]}"; do
+              required_tag=$(trim "$required_tag")
+              [[ -z "$required_tag" ]] && continue
+              resources_for_tag=$(awk -F'|' -v tag="$required_tag" '$1 == tag {print $2}' /tmp/tag-missing-pairs.txt | sort -u)
+              if [[ -n "$resources_for_tag" ]]; then
+                echo "- **${required_tag}:**" >> /tmp/tag-validation.md
+                while IFS= read -r resource_entry; do
+                  [[ -z "$resource_entry" ]] && continue
+                  echo "  - \`${resource_entry}\`" >> /tmp/tag-validation.md
+                done <<< "$resources_for_tag"
+              fi
+            done
+          else
+            echo "- None" >> /tmp/tag-validation.md
+          fi
+          echo "" >> /tmp/tag-validation.md
           
           echo "---" >> /tmp/tag-validation.md
           echo "| Resources Checked | $RESOURCES_CHECKED | Missing Tags | $MISSING_TAGS |" >> /tmp/tag-validation.md
@@ -1305,10 +1851,76 @@ jobs:
         with:
           script: |
             const fs = require('fs');
+            const commentMarker = '<!-- azure-cost-analysis-comment -->';
             const analysis = fs.readFileSync('/tmp/copilot-analysis.md', 'utf8');
             const costImpact = fs.existsSync('/tmp/cost-impact.md') ? fs.readFileSync('/tmp/cost-impact.md', 'utf8') : '';
-            const analysisWithoutCostSection = analysis.replace(/### 💰 Cost Impact Analysis[\s\S]*?(?=\n### |$)/, '').trim();
-            const body = `## 🤖 Azure Cost Analysis by GitHub Copilot
+            const tagValidation = fs.existsSync('/tmp/tag-validation.md') ? fs.readFileSync('/tmp/tag-validation.md', 'utf8') : '';
+
+            const parseCostRows = (markdown) => markdown
+              .split('\n')
+              .filter(line => /^\| \*\*(Added|Modified|Removed)\*\* \|/.test(line))
+              .map(line => {
+                const cells = line.split('|').slice(1, -1).map(cell => cell.trim());
+                return {
+                  action: (cells[0] || '').replace(/\*\*/g, ''),
+                  resource: (cells[1] || '').replace(/`/g, ''),
+                  estimate: cells[2] || '',
+                  sku: cells[3] || '',
+                  notes: cells[4] || ''
+                };
+              });
+
+            const buildDeterministicResourceSummary = (rows) => {
+              const byAction = { Added: [], Modified: [], Removed: [] };
+              for (const row of rows) {
+                if (!byAction[row.action]) continue;
+                const line = `  - \`${row.resource}\`: ${row.sku || 'N/A'}${row.estimate ? ` (${row.estimate})` : ''}.`;
+                byAction[row.action].push(line);
+              }
+
+              const section = [
+                '### 📦 Resource Changes Summary',
+                '- **Added:**',
+                ...(byAction.Added.length ? byAction.Added : ['  - None.']),
+                '- **Modified:**',
+                ...(byAction.Modified.length ? byAction.Modified : ['  - None.']),
+                '- **Removed:**',
+                ...(byAction.Removed.length ? byAction.Removed : ['  - None.'])
+              ];
+
+              return section.join('\n');
+            };
+
+            const deterministicResourceSummary = buildDeterministicResourceSummary(parseCostRows(costImpact));
+            const tagSummaryMatch = tagValidation.match(/### Summary[\s\S]*?(?=\n### Missing tags|\n---|$)/);
+            const tagSummarySection = tagSummaryMatch ? tagSummaryMatch[0].trim() : '';
+            const groupedTagSectionMatch = tagValidation.match(/### Missing tags[\s\S]*?(?=\n---|$)/);
+            const groupedTagSection = groupedTagSectionMatch ? groupedTagSectionMatch[0].trim() : '';
+            let analysisWithoutCostSection = analysis.replace(/### 💰 Cost Impact Analysis[\s\S]*?(?=\n### |$)/, '').trim();
+
+            if (deterministicResourceSummary) {
+              if (/### 📦 Resource Changes Summary/.test(analysisWithoutCostSection)) {
+                analysisWithoutCostSection = analysisWithoutCostSection.replace(/### 📦 Resource Changes Summary[\s\S]*?(?=\n### |$)/, `${deterministicResourceSummary}\n\n`);
+              } else {
+                analysisWithoutCostSection = `${deterministicResourceSummary}\n\n${analysisWithoutCostSection}`.trim();
+              }
+            }
+
+            if (tagSummarySection || groupedTagSection) {
+              const deterministicTagCompliance = [
+                '### 🏷️ Tag Compliance',
+                tagSummarySection,
+                groupedTagSection,
+              ].filter(Boolean).join('\n\n');
+
+              if (/### 🏷️ Tag Compliance/.test(analysisWithoutCostSection)) {
+                analysisWithoutCostSection = analysisWithoutCostSection.replace(/### 🏷️ Tag Compliance[\s\S]*?(?=\n### |$)/, `${deterministicTagCompliance}\n\n`);
+              } else {
+                analysisWithoutCostSection = `${analysisWithoutCostSection}\n\n${deterministicTagCompliance}`.trim();
+              }
+            }
+            const body = `${commentMarker}
+            ## 🤖 Azure Cost Analysis by GitHub Copilot
 
             ${costImpact ? `${costImpact}
 
@@ -1318,26 +1930,37 @@ jobs:
             <sub>📊 **Analysis Details:** TF Directory: \`${{ inputs.terraform_directory }}\` | Region: \`${{ inputs.azure_region }}\` | Model: \`${{ inputs.ai_model }}\`</sub>
             <sub>🔧 **Data Sources:** Azure Resource Graph, Azure Advisor, Azure Cost Management, Terraform Plan</sub>`;
             
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
+            const prNumber = context.issue.number || context.payload.pull_request?.number;
             
-            const botComment = comments.find(c => 
-              c.user.type === 'Bot' && c.body.includes('Azure Cost Analysis by GitHub Copilot')
-            );
-            
-            const commentParams = {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: body
-            };
-            
-            if (botComment) {
-              await github.rest.issues.updateComment({ ...commentParams, comment_id: botComment.id });
+            if (prNumber) {
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+              });
+              
+              const botComment = comments.find(c => 
+                c.user.type === 'Bot' && (
+                  c.body.includes(commentMarker) ||
+                  c.body.includes('Azure Cost Analysis by GitHub Copilot')
+                )
+              );
+              
+              const commentParams = {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              };
+              
+              if (botComment) {
+                await github.rest.issues.updateComment({ ...commentParams, comment_id: botComment.id });
+              } else {
+                await github.rest.issues.createComment({ ...commentParams, issue_number: prNumber });
+              }
             } else {
-              await github.rest.issues.createComment({ ...commentParams, issue_number: context.issue.number });
+              // No PR context (e.g. workflow_dispatch) — write to job summary instead
+              await core.summary.addRaw(body).write();
+              console.log('No PR found — analysis written to job summary.');
             }
 
       - name: Azure Logout

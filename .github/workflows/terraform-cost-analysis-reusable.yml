@@ -1324,7 +1324,7 @@ jobs:
             const orphanedResources = fs.existsSync('/tmp/orphaned-resources.md') ? fs.readFileSync('/tmp/orphaned-resources.md', 'utf8') : '';
             const azureCosts = fs.existsSync('/tmp/azure-costs.md') ? fs.readFileSync('/tmp/azure-costs.md', 'utf8') : '';
             
-            const maxLen = 10000;
+            const maxLen = 1500;
             const truncate = (str) => str.length > maxLen ? str.substring(0, maxLen) + '\n... (truncated)' : str;
             const workflowDate = new Date().toISOString().slice(0, 10);
             const extractPricingRows = (markdown) => markdown
@@ -1393,88 +1393,44 @@ jobs:
               ].join('\n');
             };
             
-            const prompt = `You are an Azure Cost Optimization expert (similar to Azure's AzureCostOptimizeAgent). 
-            Analyze the following Terraform changes and Azure data to provide comprehensive cost analysis.
+            const prompt = `Azure Cost Optimization: analyse these Terraform changes for ${process.env.AZURE_REGION}. Date: ${workflowDate}. Use LIVE PRICING rows verbatim. Report in GBP.
 
-            Today's date is ${workflowDate}. Treat this as the pricing reference date for your narrative.
+## RULES
+- Use live retail pricing rows verbatim; do not invent numbers.
+- For usage-based resources, state the unit price and assumption.
+- Do not cite years like 2023.
 
-            ## YOUR MISSION
-            1. **Estimate Cost Impact**: Calculate monthly cost changes based on Azure pricing for ${process.env.AZURE_REGION} region
-            2. **Identify Savings Opportunities**: Using Azure Advisor data and orphaned resources
-            3. **Tag Compliance**: Review tag validation
-            4. **Security & Best Practices**: Identify issues
-            5. **Actionable Recommendations**: Provide specific commands or changes
+## TERRAFORM PLAN
+${truncate(tfPlan)}
 
-            ## FRESHNESS RULES
-            - Use current-date language anchored to ${workflowDate}.
-            - Do not mention training cutoffs, knowledge cutoffs, or stale dates such as 2023.
-            - Do not say "as of 2023" or similar anywhere in the response.
-            - Prefer the LIVE AZURE RETAIL PRICING section over model priors whenever it contains a matching price row.
-            - If exact live retail pricing cannot be proven from the supplied Azure data, say the estimate is based on current workflow data and set confidence to Medium instead of citing an old year.
-            - For usage-based resources such as storage accounts or Application Insights, do not invent a fixed monthly cost unless the Terraform clearly specifies billable quantity. Use unit pricing and call out the assumption if you provide an example monthly figure.
-            - For hourly or daily SKUs with a live retail row, derive the monthly estimate from that live retail row.
-            - If LIVE AZURE RETAIL PRICING contains a row for a resource, you MUST use that row's unit price and monthly estimate verbatim in the cost table instead of inventing a different number.
-            - If a LIVE AZURE RETAIL PRICING row shows Variable for monthly estimate, keep the table entry as Variable and explain the assumption in Notes.
+## DIFF
+${truncate(diffContent)}
 
-            ## TERRAFORM PLAN OUTPUT
-            ${truncate(tfPlan)}
+## LIVE PRICING
+${truncate(azurePricing)}
 
-            ## TERRAFORM DIFF
-            ${truncate(diffContent)}
+## COST IMPACT (deterministic)
+${truncate(costImpact)}
 
-            ## LIVE AZURE RETAIL PRICING
-            ${truncate(azurePricing)}
+## ADVISOR
+${truncate(azureAdvisor)}
 
-            ## BASE TERRAFORM (Before)
-            ${truncate(baseTerraform)}
+## ORPHANED
+${truncate(orphanedResources)}
 
-            ## PR TERRAFORM (After)
-            ${truncate(prTerraform)}
+## TAGS
+${truncate(tagValidation)}
 
-            ## AZURE ADVISOR RECOMMENDATIONS
-            ${truncate(azureAdvisor)}
+## OUTPUT (use this exact markdown structure)
+### 💰 Cost Impact Analysis
+| Change | Resource | Est. Monthly Cost | Azure SKU/Tier | Notes |
+|--------|----------|-------------------|----------------|-------|
 
-            ## ORPHANED RESOURCES
-            ${truncate(orphanedResources)}
-
-            ## CURRENT AZURE COSTS
-            ${truncate(azureCosts)}
-
-            ## TAG VALIDATION
-            ${truncate(tagValidation)}
-
-            ## OUTPUT FORMAT (use exactly this markdown structure)
-
-            ### 💰 Cost Impact Analysis
-            | Change | Resource | Est. Monthly Cost | Azure SKU/Tier | Notes |
-            |--------|----------|-------------------|----------------|-------|
-            | Added/Modified/Removed | resource_name | £X.XX | SKU details | explanation |
-
-            **Total Estimated Monthly Impact:** £X.XX (increase/decrease)
-            **Confidence Level:** High/Medium/Low (based on available data)
-
-            ### 📦 Resource Changes Summary
-            - **Added:** resources with SKU details
-            - **Modified:** resources and what changed
-            - **Removed:** resources
-
-            ### 💡 Cost Optimization Recommendations
-            Based on Azure best practices and the analysis:
-            1. [Specific recommendation with savings estimate in GBP and Azure CLI command if applicable]
-            2. [Reserved Instance recommendations if applicable]
-            3. [Right-sizing recommendations]
-            4. [Orphaned resource cleanup]
-
-            ### 🏷️ Tag Compliance
-            [Summary with specific missing tags]
-
-            ### 🔐 Security & Best Practices
-            [Azure Well-Architected Framework alignment]
-
-            ### ⚡ Quick Wins
-            [Immediate actions that can save money with minimal risk]
-
-            Use accurate Azure pricing for ${process.env.AZURE_REGION} region. Report all monetary values in GBP (£). Reference specific Azure SKUs and tiers. If a resource has only unit pricing, say so explicitly instead of presenting a false fixed monthly total.`;
+### 📦 Resource Changes Summary
+### 💡 Cost Optimization Recommendations
+### 🏷️ Tag Compliance
+### 🔐 Security & Best Practices
+### ⚡ Quick Wins`;
 
             try {
               const response = await fetch('https://models.inference.ai.azure.com/chat/completions', {
@@ -1492,7 +1448,7 @@ jobs:
                     },
                     { role: 'user', content: prompt }
                   ],
-                  max_tokens: 4000,
+                  max_tokens: 2000,
                   temperature: 0.2
                 })
               });

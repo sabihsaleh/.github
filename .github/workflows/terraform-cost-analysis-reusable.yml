@@ -1286,9 +1286,6 @@ jobs:
                 block_content=$(sed -n "${line_num},$((line_num + 100))p" "$file" 2>/dev/null || true)
                 
                 if ! echo "$block_content" | grep -q "tags\s*="; then
-                  echo "### ❌ \`$resource_type.$resource_name\`" >> /tmp/tag-validation.md
-                  echo "**File:** \`$file\` | **Issue:** No tags block" >> /tmp/tag-validation.md
-                  echo "" >> /tmp/tag-validation.md
                   MISSING_TAGS=$((MISSING_TAGS + ${#REQUIRED_TAGS[@]}))
                   for required_tag in "${REQUIRED_TAGS[@]}"; do
                     required_tag=$(trim "$required_tag")
@@ -1308,9 +1305,6 @@ jobs:
                   done
 
                   if [[ ${#missing_for_resource[@]} -gt 0 ]]; then
-                    echo "### ❌ \`$resource_type.$resource_name\`" >> /tmp/tag-validation.md
-                    echo "**File:** \`$file\` | **Missing Tags:** ${missing_for_resource[*]}" >> /tmp/tag-validation.md
-                    echo "" >> /tmp/tag-validation.md
                     MISSING_TAGS=$((MISSING_TAGS + ${#missing_for_resource[@]}))
                     for missing_tag in "${missing_for_resource[@]}"; do
                       echo "${missing_tag}|${resource_type}.${resource_name}" >> /tmp/tag-missing-pairs.txt
@@ -1339,25 +1333,6 @@ jobs:
           fi
           echo "" >> /tmp/tag-validation.md
 
-          echo "### Missing tags" >> /tmp/tag-validation.md
-          if [[ -s /tmp/tag-missing-pairs.txt ]]; then
-            for required_tag in "${REQUIRED_TAGS[@]}"; do
-              required_tag=$(trim "$required_tag")
-              [[ -z "$required_tag" ]] && continue
-              resources_for_tag=$(awk -F'|' -v tag="$required_tag" '$1 == tag {print $2}' /tmp/tag-missing-pairs.txt | sort -u)
-              if [[ -n "$resources_for_tag" ]]; then
-                echo "- **${required_tag}:**" >> /tmp/tag-validation.md
-                while IFS= read -r resource_entry; do
-                  [[ -z "$resource_entry" ]] && continue
-                  echo "  - \`${resource_entry}\`" >> /tmp/tag-validation.md
-                done <<< "$resources_for_tag"
-              fi
-            done
-          else
-            echo "- None" >> /tmp/tag-validation.md
-          fi
-          echo "" >> /tmp/tag-validation.md
-          
           echo "---" >> /tmp/tag-validation.md
           echo "| Resources Checked | $RESOURCES_CHECKED | Missing Tags | $MISSING_TAGS |" >> /tmp/tag-validation.md
           
@@ -1519,6 +1494,12 @@ jobs:
                 .replace(/\*\*Confidence Level:\*\*\s*([^\n]*?)\s*\(based on[^\n)]*20\d{2}[^\n)]*\)/gi, '**Confidence Level:** $1 (based on current workflow data and Azure references)')
                 .replace(/based on Azure pricing for [^\n]*20\d{2}/gi, 'based on current workflow data and Azure references');
 
+              // Remove repetitive generic tagging recommendation block from Cost Optimization Recommendations.
+              analysis = analysis.replace(
+                /\n?\s*(?:^|\n)\s*2\.\s*\*\*?Tagging for Cost Management\*\*?[\s\S]*?(?=\n\s*\d+\.\s|\n\s*---|$)/im,
+                '\n'
+              );
+
               const deterministicCostSection = costImpact.trim() || buildDeterministicCostSection(extractPricingRows(azurePricing));
               if (deterministicCostSection) {
                 analysis = analysis.replace(/### 💰 Cost Impact Analysis[\s\S]*?(?=\n### )/, `${deterministicCostSection}\n\n`);
@@ -1594,9 +1575,17 @@ jobs:
             const deterministicResourceSummary = buildDeterministicResourceSummary(parseCostRows(costImpact));
             const tagSummaryMatch = tagValidation.match(/### Summary[\s\S]*?(?=\n### Missing tags|\n---|$)/);
             const tagSummarySection = tagSummaryMatch ? tagSummaryMatch[0].trim() : '';
-            const groupedTagSectionMatch = tagValidation.match(/### Missing tags[\s\S]*?(?=\n---|$)/);
-            const groupedTagSection = groupedTagSectionMatch ? groupedTagSectionMatch[0].trim() : '';
             let analysisWithoutCostSection = analysis.replace(/### 💰 Cost Impact Analysis[\s\S]*?(?=\n### |$)/, '').trim();
+
+            // Remove additional model-generated Cost Impact sections to avoid duplication.
+            analysisWithoutCostSection = analysisWithoutCostSection
+              .replace(/\n?#{2,6}\s*\**\s*Cost Impact Analysis\s*\**[\s\S]*?(?=\n#{2,6}\s|$)/gi, '\n')
+              .trim();
+
+            // Remove generic tag recommendation text from the AI-generated body.
+            analysisWithoutCostSection = analysisWithoutCostSection
+              .replace(/\n?\s*\d+\.\s*\*\*?Tagging for Cost Management\*\*?[\s\S]*?(?=\n\s*\d+\.\s|\n\s*#{2,6}\s|$)/im, '\n')
+              .trim();
 
             if (deterministicResourceSummary) {
               if (/### 📦 Resource Changes Summary/.test(analysisWithoutCostSection)) {
@@ -1606,11 +1595,10 @@ jobs:
               }
             }
 
-            if (tagSummarySection || groupedTagSection) {
+            if (tagSummarySection) {
               const deterministicTagCompliance = [
                 '### 🏷️ Tag Compliance',
                 tagSummarySection,
-                groupedTagSection,
               ].filter(Boolean).join('\n\n');
 
               if (/### 🏷️ Tag Compliance/.test(analysisWithoutCostSection)) {

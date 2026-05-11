@@ -98,11 +98,6 @@ jobs:
           ref: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch || 'main' }}
           path: base
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_wrapper: false
-
       # Azure Login using Service Principal
       - name: Azure Login
         uses: azure/login@v2
@@ -142,16 +137,6 @@ jobs:
           
           echo "=== BASE BRANCH TERRAFORM FILES ===" > /tmp/base-terraform.txt
           find "base/${{ inputs.terraform_directory }}" -name "*.tf" -exec echo "--- {} ---" \; -exec cat {} \; >> /tmp/base-terraform.txt 2>/dev/null || true
-
-      - name: Run Terraform Plan (PR Branch)
-        if: steps.check_files.outputs.has_tf_files == 'true'
-        id: tf_plan
-        run: |
-          cd "${{ inputs.terraform_directory }}"
-          terraform init -backend=false
-          terraform plan -no-color -out=tfplan 2>&1 | tee /tmp/terraform-plan.txt || true
-          terraform show -no-color tfplan > /tmp/terraform-plan-details.txt 2>&1 || true
-        continue-on-error: true
 
       # Get Azure Pricing for resources in Terraform
       - name: Get Azure Pricing Info
@@ -290,34 +275,29 @@ jobs:
             local pr_checksum
             local base_checksum
 
-            if grep -q "^# ${address} will be created" /tmp/terraform-plan.txt 2>/dev/null; then
-              echo "Added"
-            elif grep -q "^# ${address} will be updated in-place" /tmp/terraform-plan.txt 2>/dev/null; then
-              echo "Modified"
-            elif grep -q "^# ${address} must be replaced" /tmp/terraform-plan.txt 2>/dev/null; then
-              echo "Modified"
-            elif grep -q "^# ${address} will be destroyed" /tmp/terraform-plan.txt 2>/dev/null; then
-              echo "Removed"
-            else
-              resource_exists_in_dir "$TF_DIR" "$resource_type" "$resource_name" || pr_exists=0
-              resource_exists_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" || base_exists=0
+            resource_exists_in_dir "$TF_DIR" "$resource_type" "$resource_name" || pr_exists=0
+            resource_exists_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" || base_exists=0
 
-              if [[ "$pr_exists" -eq 1 && "$base_exists" -eq 0 ]]; then
-                echo "Added"
+            if [[ "$pr_exists" -eq 1 && "$base_exists" -eq 0 ]]; then
+              echo "Added"
+              return
+            fi
+
+            if [[ "$pr_exists" -eq 0 && "$base_exists" -eq 1 ]]; then
+              echo "Removed"
+              return
+            fi
+
+            if [[ "$pr_exists" -eq 1 && "$base_exists" -eq 1 ]]; then
+              pr_checksum=$(resource_block_checksum_in_dir "$TF_DIR" "$resource_type" "$resource_name")
+              base_checksum=$(resource_block_checksum_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name")
+              if [[ -n "$pr_checksum" && -n "$base_checksum" && "$pr_checksum" != "$base_checksum" ]]; then
+                echo "Modified"
                 return
               fi
-
-              if [[ "$pr_exists" -eq 1 && "$base_exists" -eq 1 ]]; then
-                pr_checksum=$(resource_block_checksum_in_dir "$TF_DIR" "$resource_type" "$resource_name")
-                base_checksum=$(resource_block_checksum_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name")
-                if [[ -n "$pr_checksum" && -n "$base_checksum" && "$pr_checksum" != "$base_checksum" ]]; then
-                  echo "Modified"
-                  return
-                fi
-              fi
-
-              echo ""
             fi
+
+            echo ""
           }
 
           format_delta_estimate() {
@@ -1436,7 +1416,6 @@ jobs:
             const prTerraform = fs.readFileSync('/tmp/pr-terraform.txt', 'utf8');
             const baseTerraform = fs.readFileSync('/tmp/base-terraform.txt', 'utf8');
             const diffContent = fs.readFileSync('/tmp/terraform-diff.txt', 'utf8');
-            const tfPlan = fs.existsSync('/tmp/terraform-plan.txt') ? fs.readFileSync('/tmp/terraform-plan.txt', 'utf8') : 'Plan not available';
             const tagValidation = fs.readFileSync('/tmp/tag-validation.md', 'utf8');
             const azurePricing = fs.existsSync('/tmp/azure-pricing.md') ? fs.readFileSync('/tmp/azure-pricing.md', 'utf8') : '';
             const costImpact = fs.existsSync('/tmp/cost-impact.md') ? fs.readFileSync('/tmp/cost-impact.md', 'utf8') : '';
@@ -1461,20 +1440,6 @@ jobs:
                 notes,
               }));
 
-            const typeToAddress = Object.fromEntries(
-              [...prTerraform.matchAll(/resource\s+"([^"]+)"\s+"([^"]+)"/g)].map(([, type, name]) => [type, `${type}.${name}`])
-            );
-
-            const planActions = Object.fromEntries(
-              [...tfPlan.matchAll(/^#\s+(\S+)\s+will be\s+(.+)$/gm)].map(([, address, actionText]) => {
-                let action = 'Modified';
-                if (actionText.includes('created')) action = 'Added';
-                else if (actionText.includes('destroyed')) action = 'Removed';
-                else if (actionText.includes('read during apply')) action = 'Read';
-                return [address, action];
-              })
-            );
-
             const buildDeterministicCostSection = (pricingRows) => {
               if (!pricingRows.length) return '';
 
@@ -1482,8 +1447,8 @@ jobs:
               let hasVariable = false;
 
               const tableRows = pricingRows.map((row) => {
-                const resourceAddress = typeToAddress[row.resourceType] || row.resourceType;
-                const action = planActions[resourceAddress] || (row.resourceType === 'azurerm_storage_account' ? 'Modified' : 'Added');
+                const resourceAddress = row.resourceType;
+                const action = 'Modified';
                 const numericMonthly = row.monthlyEstimate.match(/^£([\d,.]+)$/);
                 if (numericMonthly) {
                   totalFixed += parseFloat(numericMonthly[1].replace(/,/g, ''));
@@ -1516,8 +1481,9 @@ jobs:
             const sections = [
               `Azure Cost Optimization: analyse Terraform changes for ${process.env.AZURE_REGION}. Date: ${workflowDate}. Use LIVE PRICING rows verbatim. Report in GBP.`,
               'RULES: Use live retail pricing rows verbatim. For usage-based resources state the unit price and assumption. Do not cite years like 2023.',
-              `TERRAFORM PLAN:\n${truncate(tfPlan)}`,
               `DIFF:\n${truncate(diffContent)}`,
+              `PR TERRAFORM:\n${truncate(prTerraform)}`,
+              `BASE TERRAFORM:\n${truncate(baseTerraform)}`,
               `LIVE PRICING:\n${truncate(azurePricing)}`,
               `COST IMPACT:\n${truncate(costImpact)}`,
               `ADVISOR:\n${truncate(azureAdvisor)}`,
@@ -1690,7 +1656,7 @@ jobs:
 
             ---
             <sub>📊 **Analysis Details:** TF Directory: \`${{ inputs.terraform_directory }}\` | Region: \`${{ inputs.azure_region }}\` | Model: \`${{ inputs.ai_model }}\`</sub>
-            <sub>🔧 **Data Sources:** Azure Resource Graph, Azure Advisor, Azure Cost Management, Terraform Plan</sub>`;
+            <sub>🔧 **Data Sources:** Git Diff (PR vs Base), Azure Retail Prices API, Azure Resource Graph, Azure Advisor, Azure Cost Management</sub>`;
             
             const prNumber = context.issue.number || context.payload.pull_request?.number;
             

@@ -1333,6 +1333,39 @@ jobs:
           fi
           echo "" >> /tmp/tag-validation.md
 
+          echo "### Missing Tags by Resource" >> /tmp/tag-validation.md
+          echo "" >> /tmp/tag-validation.md
+          if [[ -s /tmp/tag-missing-pairs.txt ]]; then
+            echo "| Resource | Missing Tags |" >> /tmp/tag-validation.md
+            echo "|----------|--------------|" >> /tmp/tag-validation.md
+            awk -F'|' '
+              {
+                if ($1 == "" || $2 == "") next
+                resource = $2
+                tag = $1
+                seen_key = resource "|" tag
+                if (seen[seen_key]) next
+                seen[seen_key] = 1
+                if (tags[resource] == "") {
+                  tags[resource] = tag
+                } else {
+                  tags[resource] = tags[resource] ", " tag
+                }
+              }
+              END {
+                for (resource in tags) {
+                  print resource "|" tags[resource]
+                }
+              }
+            ' /tmp/tag-missing-pairs.txt | sort | while IFS='|' read -r resource_entry tags_entry; do
+              [[ -z "$resource_entry" ]] && continue
+              echo "| \`$resource_entry\` | $tags_entry |" >> /tmp/tag-validation.md
+            done
+          else
+            echo "No missing tags detected." >> /tmp/tag-validation.md
+          fi
+          echo "" >> /tmp/tag-validation.md
+
           echo "---" >> /tmp/tag-validation.md
           echo "| Resources Checked | $RESOURCES_CHECKED | Missing Tags | $MISSING_TAGS |" >> /tmp/tag-validation.md
           
@@ -1496,7 +1529,7 @@ jobs:
 
               // Remove repetitive generic tagging recommendation block from Cost Optimization Recommendations.
               analysis = analysis.replace(
-                /\n?\s*(?:^|\n)\s*2\.\s*\*\*?Tagging for Cost Management\*\*?[\s\S]*?(?=\n\s*\d+\.\s|\n\s*---|$)/im,
+                /\n?\s*(?:^|\n)\s*\d+\.\s*\*\*?Tagging for Cost Management\*\*?[\s\S]*?(?=\n\s*\d+\.\s|\n\s*---|$)/im,
                 '\n'
               );
 
@@ -1539,7 +1572,7 @@ jobs:
 
             const parseCostRows = (markdown) => markdown
               .split('\n')
-              .filter(line => /^\| \*\*(Added|Modified|Removed)\*\* \|/.test(line))
+              .filter(line => /^\|\s*\*\*(Added|Modified|Removed|Read)\*\*\s*\|/.test(line))
               .map(line => {
                 const cells = line.split('|').slice(1, -1).map(cell => cell.trim());
                 return {
@@ -1552,6 +1585,8 @@ jobs:
               });
 
             const buildDeterministicResourceSummary = (rows) => {
+              if (!rows.length) return '';
+
               const byAction = { Added: [], Modified: [], Removed: [] };
               for (const row of rows) {
                 if (!byAction[row.action]) continue;
@@ -1573,13 +1608,20 @@ jobs:
             };
 
             const deterministicResourceSummary = buildDeterministicResourceSummary(parseCostRows(costImpact));
-            const tagSummaryMatch = tagValidation.match(/### Summary[\s\S]*?(?=\n### Missing tags|\n---|$)/);
+            const tagSummaryMatch = tagValidation.match(/### Summary[\s\S]*?(?=\n### Missing Tags by Resource|\n---|$)/);
             const tagSummarySection = tagSummaryMatch ? tagSummaryMatch[0].trim() : '';
+            const tagDetailsMatch = tagValidation.match(/### Missing Tags by Resource[\s\S]*?(?=\n---|$)/);
+            const tagDetailsSection = tagDetailsMatch ? tagDetailsMatch[0].trim() : '';
             let analysisWithoutCostSection = analysis.replace(/### 💰 Cost Impact Analysis[\s\S]*?(?=\n### |$)/, '').trim();
 
             // Remove additional model-generated Cost Impact sections to avoid duplication.
             analysisWithoutCostSection = analysisWithoutCostSection
               .replace(/\n?#{2,6}\s*\**\s*Cost Impact Analysis\s*\**[\s\S]*?(?=\n#{2,6}\s|$)/gi, '\n')
+              .trim();
+
+            // Remove any model-generated Resource Changes Summary blocks to avoid contradictory sections.
+            analysisWithoutCostSection = analysisWithoutCostSection
+              .replace(/\n?(?:#{1,6}\s*)?\*{0,2}(?:📦\s*)?Resource Changes Summary\*{0,2}\s*\n[\s\S]*?(?=\n#{1,6}\s|$)/gi, '\n')
               .trim();
 
             // Remove generic tag recommendation text from the AI-generated body.
@@ -1588,17 +1630,14 @@ jobs:
               .trim();
 
             if (deterministicResourceSummary) {
-              if (/### 📦 Resource Changes Summary/.test(analysisWithoutCostSection)) {
-                analysisWithoutCostSection = analysisWithoutCostSection.replace(/### 📦 Resource Changes Summary[\s\S]*?(?=\n### |$)/, `${deterministicResourceSummary}\n\n`);
-              } else {
-                analysisWithoutCostSection = `${deterministicResourceSummary}\n\n${analysisWithoutCostSection}`.trim();
-              }
+              analysisWithoutCostSection = `${deterministicResourceSummary}\n\n${analysisWithoutCostSection}`.trim();
             }
 
-            if (tagSummarySection) {
+            if (tagSummarySection || tagDetailsSection) {
               const deterministicTagCompliance = [
                 '### 🏷️ Tag Compliance',
                 tagSummarySection,
+                tagDetailsSection,
               ].filter(Boolean).join('\n\n');
 
               if (/### 🏷️ Tag Compliance/.test(analysisWithoutCostSection)) {

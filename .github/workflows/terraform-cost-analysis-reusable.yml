@@ -1,4 +1,4 @@
-# Reusable Terraform/CDKTF Cost Analysis Workflow using Azure Native Tools + GitHub Copilot
+# Reusable Terraform Cost Analysis Workflow using Azure Native Tools + GitHub Copilot
 # Uses: Azure CLI, Azure Cost Management, Azure Resource Graph, Azure Advisor
 # NO Infracost required!
 #
@@ -13,7 +13,7 @@
 #         AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
 #         AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-name: Terraform/CDKTF Cost Analysis (Azure Native + Copilot)
+name: Terraform Cost Analysis (Azure Native + Copilot)
 
 on:
   workflow_call:
@@ -23,16 +23,6 @@ on:
         required: false
         type: string
         default: 'infra'
-      iac_framework:
-        description: 'Infrastructure framework to analyze: auto, terraform, or cdktf'
-        required: false
-        type: string
-        default: 'auto'
-      cdk_synth_command:
-        description: 'Command used to synthesize CDKTF into Terraform for analysis'
-        required: false
-        type: string
-        default: 'npx cdktf synth --output .cost-analysis/generated-tf'
       required_tags:
         description: 'Comma-separated list of required tags'
         required: false
@@ -125,106 +115,39 @@ jobs:
           az extension add --name resource-graph --yes || true
           az extension add --name advisor --yes || true
 
-      - name: Resolve IaC Source (Terraform/CDKTF)
+      - name: Check for Terraform files
         id: check_files
-        shell: bash
         run: |
-          set -euo pipefail
-
-          REQUESTED_TF_DIR="${{ inputs.terraform_directory }}"
-          IAC_MODE="${{ inputs.iac_framework }}"
-          CDK_SYNTH_COMMAND="${{ inputs.cdk_synth_command }}"
-          GENERATED_TF_DIR=".cost-analysis/generated-tf"
-
-          HAS_TF_FILES=false
-          SOURCE_MODE="none"
-          ANALYSIS_TF_DIR="$REQUESTED_TF_DIR"
-
-          if [[ "$IAC_MODE" != "cdktf" ]] && find "$REQUESTED_TF_DIR" -name "*.tf" -type f 2>/dev/null | grep -q .; then
-            HAS_TF_FILES=true
-            SOURCE_MODE="terraform"
-          fi
-
-          SHOULD_SYNTH=false
-          if [[ "$IAC_MODE" == "cdktf" ]]; then
-            SHOULD_SYNTH=true
-          elif [[ "$IAC_MODE" == "auto" && "$HAS_TF_FILES" == "false" ]]; then
-            SHOULD_SYNTH=true
-          fi
-
-          if [[ "$SHOULD_SYNTH" == "true" ]]; then
-            if [[ ! -f "cdk.json" && ! -f "cdktf.json" ]]; then
-              echo "::warning::CDKTF mode selected, but neither cdk.json nor cdktf.json was found in repository root."
-            else
-              rm -rf "$GENERATED_TF_DIR" "base/$GENERATED_TF_DIR"
-
-              if [[ -f package-lock.json ]]; then
-                npm ci
-              elif [[ -f package.json ]]; then
-                npm install
-              fi
-
-              eval "$CDK_SYNTH_COMMAND"
-
-              if [[ -f base/package-lock.json ]]; then
-                (cd base && npm ci)
-              elif [[ -f base/package.json ]]; then
-                (cd base && npm install)
-              fi
-
-              (cd base && eval "$CDK_SYNTH_COMMAND")
-
-              if find "$GENERATED_TF_DIR" -name "*.tf" -type f 2>/dev/null | grep -q .; then
-                HAS_TF_FILES=true
-                SOURCE_MODE="cdktf"
-                ANALYSIS_TF_DIR="$GENERATED_TF_DIR"
-              else
-                echo "::warning::CDKTF synthesis completed, but no Terraform files were generated."
-              fi
-            fi
-          fi
-
-          if [[ "$HAS_TF_FILES" == "true" ]]; then
+          if find "${{ inputs.terraform_directory }}" -name "*.tf" -type f 2>/dev/null | grep -q .; then
             echo "has_tf_files=true" >> $GITHUB_OUTPUT
-            echo "source_mode=$SOURCE_MODE" >> $GITHUB_OUTPUT
-            echo "analysis_tf_dir=$ANALYSIS_TF_DIR" >> $GITHUB_OUTPUT
-            echo "Detected IaC source: $SOURCE_MODE"
-            echo "Terraform analysis directory: $ANALYSIS_TF_DIR"
           else
             echo "has_tf_files=false" >> $GITHUB_OUTPUT
-            echo "source_mode=none" >> $GITHUB_OUTPUT
-            echo "analysis_tf_dir=$REQUESTED_TF_DIR" >> $GITHUB_OUTPUT
-            echo "::warning::No Terraform files found for analysis in $REQUESTED_TF_DIR (mode: $IAC_MODE)."
+            echo "::warning::No Terraform files found in ${{ inputs.terraform_directory }}"
           fi
 
       - name: Get Changed Files
         if: steps.check_files.outputs.has_tf_files == 'true'
         id: changed_files
         run: |
-          if [[ "${{ steps.check_files.outputs.source_mode }}" == "cdktf" ]]; then
-            CHANGED_FILES=$(find "${{ steps.check_files.outputs.analysis_tf_dir }}" -name "*.tf" -type f 2>/dev/null | tr '\n' ' ')
-            diff -ru --new-file "base/${{ steps.check_files.outputs.analysis_tf_dir }}" "${{ steps.check_files.outputs.analysis_tf_dir }}" > /tmp/terraform-diff.txt || true
-          else
-            BASE_REF="${{ github.event.pull_request.base.ref || github.event.repository.default_branch || 'main' }}"
-            CHANGED_FILES=$(git diff --name-only origin/${BASE_REF} -- '*.tf' '*.tfvars' | tr '\n' ' ')
-            git diff origin/${BASE_REF} -- '*.tf' '*.tfvars' > /tmp/terraform-diff.txt
-          fi
+          BASE_REF="${{ github.event.pull_request.base.ref || github.event.repository.default_branch || 'main' }}"
+          CHANGED_FILES=$(git diff --name-only origin/${BASE_REF} -- '*.tf' '*.tfvars' | tr '\n' ' ')
+          git diff origin/${BASE_REF} -- '*.tf' '*.tfvars' > /tmp/terraform-diff.txt
           echo "files=$CHANGED_FILES" >> $GITHUB_OUTPUT
 
       - name: Collect Terraform Content
         if: steps.check_files.outputs.has_tf_files == 'true'
         run: |
           echo "=== PR BRANCH TERRAFORM FILES ===" > /tmp/pr-terraform.txt
-          find "${{ steps.check_files.outputs.analysis_tf_dir }}" -name "*.tf" -exec echo "--- {} ---" \; -exec cat {} \; >> /tmp/pr-terraform.txt 2>/dev/null || true
+          find "${{ inputs.terraform_directory }}" -name "*.tf" -exec echo "--- {} ---" \; -exec cat {} \; >> /tmp/pr-terraform.txt 2>/dev/null || true
           
           echo "=== BASE BRANCH TERRAFORM FILES ===" > /tmp/base-terraform.txt
-          find "base/${{ steps.check_files.outputs.analysis_tf_dir }}" -name "*.tf" -exec echo "--- {} ---" \; -exec cat {} \; >> /tmp/base-terraform.txt 2>/dev/null || true
+          find "base/${{ inputs.terraform_directory }}" -name "*.tf" -exec echo "--- {} ---" \; -exec cat {} \; >> /tmp/base-terraform.txt 2>/dev/null || true
 
       - name: Run Terraform Plan (PR Branch)
         if: steps.check_files.outputs.has_tf_files == 'true'
         id: tf_plan
         run: |
-          cd "${{ steps.check_files.outputs.analysis_tf_dir }}"
+          cd "${{ inputs.terraform_directory }}"
           terraform init -backend=false
           terraform plan -no-color -out=tfplan 2>&1 | tee /tmp/terraform-plan.txt || true
           terraform show -no-color tfplan > /tmp/terraform-plan-details.txt 2>&1 || true
@@ -236,7 +159,7 @@ jobs:
         id: azure_pricing
         env:
           ANALYSIS_AZURE_REGION: ${{ inputs.azure_region }}
-          ANALYSIS_TERRAFORM_DIRECTORY: ${{ steps.check_files.outputs.analysis_tf_dir }}
+          ANALYSIS_TERRAFORM_DIRECTORY: ${{ inputs.terraform_directory }}
         run: |
           echo "## Azure Resource Pricing Reference" > /tmp/azure-pricing.md
           echo "### 💰 Cost Impact Analysis" > /tmp/cost-impact.md
@@ -1156,7 +1079,7 @@ jobs:
         shell: bash
         run: |
           set +e  # Disable exit on error for this script
-          TF_DIR="${{ steps.check_files.outputs.analysis_tf_dir }}"
+          TF_DIR="${{ inputs.terraform_directory }}"
           IFS=',' read -ra REQUIRED_TAGS <<< "${{ inputs.required_tags }}"
 
           trim() {
@@ -1654,7 +1577,7 @@ jobs:
             ` : ''}${analysisWithoutCostSection}
 
             ---
-            <sub>📊 **Analysis Details:** TF Directory: \`${{ steps.check_files.outputs.analysis_tf_dir }}\` | Source: \`${{ steps.check_files.outputs.source_mode }}\` | Region: \`${{ inputs.azure_region }}\` | Model: \`${{ inputs.ai_model }}\`</sub>
+            <sub>📊 **Analysis Details:** TF Directory: \`${{ inputs.terraform_directory }}\` | Region: \`${{ inputs.azure_region }}\` | Model: \`${{ inputs.ai_model }}\`</sub>
             <sub>🔧 **Data Sources:** Azure Resource Graph, Azure Advisor, Azure Cost Management, Terraform Plan</sub>`;
             
             const prNumber = context.issue.number || context.payload.pull_request?.number;
@@ -1698,4 +1621,4 @@ jobs:
       - name: Skip - No Terraform Files
         if: steps.check_files.outputs.has_tf_files == 'false'
         run: |
-          echo "No Terraform files found for analysis (requested directory: ${{ inputs.terraform_directory }}, mode: ${{ inputs.iac_framework }}). Skipping analysis."
+          echo "No Terraform files found in ${{ inputs.terraform_directory }}. Skipping analysis."

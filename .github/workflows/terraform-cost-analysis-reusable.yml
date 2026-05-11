@@ -1057,8 +1057,9 @@ jobs:
           echo "" >> /tmp/cost-impact.md
           
           # Determine the cost impact direction
-          local cost_display cost_label
-          local cost_comparison=$(awk -v x="$TOTAL_FIXED" 'BEGIN { 
+          cost_display=""
+          cost_label=""
+          cost_comparison=$(awk -v x="$TOTAL_FIXED" 'BEGIN { 
             if (x < -0.001) print "decrease"
             else if (x > 0.001) print "increase"
             else print "neutral"

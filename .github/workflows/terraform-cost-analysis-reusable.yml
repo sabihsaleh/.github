@@ -545,8 +545,11 @@ jobs:
                 ;;
               azurerm_service_plan)
                 local os=$(tf_attr_in_dir "$dir" "$rt" "$rn" "os_type")
-                [[ "${os:-Linux}" == "Linux" ]] && echo "linux"
-                [[ "$os" == "Windows" ]] && echo "windows"
+                if [[ "${os:-Linux}" == "Linux" ]]; then
+                  echo "linux"
+                elif [[ "$os" == "Windows" ]]; then
+                  echo "windows"
+                fi
                 ;;
               azurerm_redis_cache)
                 local sku=$(tf_attr_in_dir "$dir" "$rt" "$rn" "sku_name")

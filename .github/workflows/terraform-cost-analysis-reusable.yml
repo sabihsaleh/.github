@@ -146,6 +146,9 @@ jobs:
           ANALYSIS_AZURE_REGION: ${{ inputs.azure_region }}
           ANALYSIS_TERRAFORM_DIRECTORY: ${{ inputs.terraform_directory }}
         run: |
+          trap 'echo "::error::Get Azure Pricing Info failed at line $LINENO (exit code $?)" >&2' ERR
+          echo "::debug::pricing script started, TF_DIR=${ANALYSIS_TERRAFORM_DIRECTORY}" >&2
+
           echo "## Azure Resource Pricing Reference" > /tmp/azure-pricing.md
           echo "### 💰 Cost Impact Analysis" > /tmp/cost-impact.md
           echo "| Change | Resource | Est. Monthly Cost | Azure SKU/Tier | Notes |" >> /tmp/cost-impact.md
@@ -751,7 +754,7 @@ jobs:
           build_api_filter() {
             local service="$1" sku_term="$2" rt="$3"
             local encoded_service
-            encoded_service=$(printf '%s' "$service" | jq -sRr @uri)
+            encoded_service=$(printf '%s' "$service" | jq -sRr @uri || printf '%s' "$service" | python3 -c "import sys,urllib.parse; print(urllib.parse.quote(sys.stdin.read().strip()))" 2>/dev/null || echo "$service")
             local filter="serviceName%20eq%20'${encoded_service}'%20and%20armRegionName%20eq%20'${ANALYSIS_AZURE_REGION}'"
 
             case "$rt" in
@@ -766,7 +769,7 @@ jobs:
               *)
                 if [[ -n "$sku_term" ]]; then
                   local encoded_sku
-                  encoded_sku=$(printf '%s' "$sku_term" | jq -sRr @uri)
+                  encoded_sku=$(printf '%s' "$sku_term" | jq -sRr @uri || printf '%s' "$sku_term" | python3 -c "import sys,urllib.parse; print(urllib.parse.quote(sys.stdin.read().strip()))" 2>/dev/null || echo "$sku_term")
                   filter+="%20and%20contains(skuName,'${encoded_sku}')"
                 fi
                 ;;
@@ -802,13 +805,13 @@ jobs:
 
               local filter api_result item_count
               filter=$(build_api_filter "$service" "$sku_term" "$resource_type")
-              api_result=$(retail_query "$filter")
+              api_result=$(retail_query "$filter" || true)
               item_count=$(echo "$api_result" | jq '.Items | length' 2>/dev/null || echo "0")
 
               if [[ "$item_count" -eq 0 && -n "$sku_term" ]]; then
                 local fallback_filter
                 fallback_filter=$(build_api_filter "$service" "" "$resource_type")
-                api_result=$(retail_query "$fallback_filter")
+                api_result=$(retail_query "$fallback_filter" || true)
                 item_count=$(echo "$api_result" | jq '.Items | length' 2>/dev/null || echo "0")
               fi
 
@@ -818,7 +821,7 @@ jobs:
               fi
 
               local selected
-              selected=$(select_best_meter "$api_result" "$product_hint" "$meter_hint" "$meter_exclude" "$product_exclude")
+              selected=$(select_best_meter "$api_result" "$product_hint" "$meter_hint" "$meter_exclude" "$product_exclude" || true)
 
               if [[ -z "$selected" || "$selected" == "null" ]]; then
                 record_unestimated_resource "$action" "$address" "${sku_term:-$resource_type}" "No matching meter found for service '$service' (removed resource)"
@@ -826,10 +829,10 @@ jobs:
               fi
 
               local unit_price meter_name unit_of_measure sku_label
-              unit_price=$(echo "$selected" | jq -r '.unitPrice')
-              meter_name=$(echo "$selected" | jq -r '.meterName')
-              unit_of_measure=$(echo "$selected" | jq -r '.unitOfMeasure')
-              sku_label=$(echo "$selected" | jq -r '.skuName')
+              unit_price=$(echo "$selected" | jq -r '.unitPrice' || true)
+              meter_name=$(echo "$selected" | jq -r '.meterName' || true)
+              unit_of_measure=$(echo "$selected" | jq -r '.unitOfMeasure' || true)
+              sku_label=$(echo "$selected" | jq -r '.skuName' || true)
 
               if [[ -z "$unit_price" || "$unit_price" == "null" || "$unit_price" == "0" ]]; then
                 record_unestimated_resource "$action" "$address" "${sku_term:-$resource_type}" "Zero-priced meter returned (removed resource)"
@@ -882,7 +885,7 @@ jobs:
             # 4. Build and execute API query
             local filter api_result
             filter=$(build_api_filter "$service" "$sku_term" "$resource_type")
-            api_result=$(retail_query "$filter")
+            api_result=$(retail_query "$filter" || true)
 
             local item_count
             item_count=$(echo "$api_result" | jq '.Items | length' 2>/dev/null || echo "0")
@@ -891,7 +894,7 @@ jobs:
             if [[ "$item_count" -eq 0 && -n "$sku_term" ]]; then
               local fallback_filter
               fallback_filter=$(build_api_filter "$service" "" "$resource_type")
-              api_result=$(retail_query "$fallback_filter")
+              api_result=$(retail_query "$fallback_filter" || true)
               item_count=$(echo "$api_result" | jq '.Items | length' 2>/dev/null || echo "0")
             fi
 
@@ -902,7 +905,7 @@ jobs:
 
             # 5. Select the best pricing meter
             local selected
-            selected=$(select_best_meter "$api_result" "$product_hint" "$meter_hint" "$meter_exclude" "$product_exclude")
+            selected=$(select_best_meter "$api_result" "$product_hint" "$meter_hint" "$meter_exclude" "$product_exclude" || true)
 
             if [[ -z "$selected" || "$selected" == "null" ]]; then
               record_unestimated_resource "$action" "$address" "${sku_term:-$resource_type}" "No matching meter found for service '$service'"
@@ -911,10 +914,10 @@ jobs:
 
             # 6. Extract price details
             local unit_price meter_name unit_of_measure sku_label
-            unit_price=$(echo "$selected" | jq -r '.unitPrice')
-            meter_name=$(echo "$selected" | jq -r '.meterName')
-            unit_of_measure=$(echo "$selected" | jq -r '.unitOfMeasure')
-            sku_label=$(echo "$selected" | jq -r '.skuName')
+            unit_price=$(echo "$selected" | jq -r '.unitPrice' || true)
+            meter_name=$(echo "$selected" | jq -r '.meterName' || true)
+            unit_of_measure=$(echo "$selected" | jq -r '.unitOfMeasure' || true)
+            sku_label=$(echo "$selected" | jq -r '.skuName' || true)
 
             if [[ -z "$unit_price" || "$unit_price" == "null" || "$unit_price" == "0" ]]; then
               record_unestimated_resource "$action" "$address" "${sku_term:-$resource_type}" "Zero-priced meter returned"
@@ -950,7 +953,7 @@ jobs:
 
               if [[ -n "$old_sku_term" ]]; then
                 old_filter=$(build_api_filter "$service" "$old_sku_term" "$resource_type")
-                old_result=$(retail_query "$old_filter")
+                old_result=$(retail_query "$old_filter" || true)
                 old_item_count=$(echo "$old_result" | jq '.Items | length' 2>/dev/null || echo "0")
 
                 if [[ "$old_item_count" -gt 0 ]]; then

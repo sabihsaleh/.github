@@ -268,6 +268,43 @@ jobs:
             fi
           }
 
+          terraform_resource_link_in_dir() {
+            local dir_path="$1"
+            local resource_type="$2"
+            local resource_name="$3"
+            local display_text="$4"
+            local branch_ref="$5"
+            local match file_path line_number repo_url
+
+            match=$(grep -R -n -m1 -F "resource \"${resource_type}\" \"${resource_name}\"" --include='*.tf' "$dir_path" 2>/dev/null | head -1)
+            if [[ -z "$match" ]]; then
+              printf '%s' "$display_text"
+              return
+            fi
+
+            file_path=${match%%:*}
+            line_number=${match#*:}
+            line_number=${line_number%%:*}
+            file_path=${file_path#./}
+            file_path=${file_path#base/}
+
+            repo_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+            branch_ref="${branch_ref:-${GITHUB_HEAD_REF:-${GITHUB_SHA}}}"
+            printf '[%s](%s/blob/%s/%s#L%s)' "$display_text" "$repo_url" "$branch_ref" "$file_path" "$line_number"
+          }
+
+          terraform_resource_link_for_action() {
+            local action="$1"
+            local resource_type="$2"
+            local resource_name="$3"
+
+            if [[ "$action" == "Removed" ]]; then
+              terraform_resource_link_in_dir "$BASE_TF_DIR" "$resource_type" "$resource_name" "$resource_type.$resource_name" "${GITHUB_BASE_REF:-main}"
+            else
+              terraform_resource_link_in_dir "$TF_DIR" "$resource_type" "$resource_name" "$resource_type.$resource_name" "${GITHUB_HEAD_REF:-${GITHUB_SHA}}"
+            fi
+          }
+
           plan_action() {
             local address="$1"
             local resource_type="${address%%.*}"
@@ -347,7 +384,7 @@ jobs:
             local monthly_estimate="$3"
             local tier="$4"
             local notes="$5"
-            echo "| **$action** | \`$address\` | $monthly_estimate | $tier | $notes |" >> /tmp/cost-impact.md
+            echo "| **$action** | $address | $monthly_estimate | $tier | $notes |" >> /tmp/cost-impact.md
             if [[ "$monthly_estimate" =~ ^(-?)£([0-9]+\.?[0-9]*)$ ]]; then
               if [[ "${BASH_REMATCH[1]}" == "-" ]]; then
                 TOTAL_FIXED=$(awk -v a="$TOTAL_FIXED" -v b="${BASH_REMATCH[2]}" 'BEGIN { printf "%.2f", a - b }')
@@ -787,13 +824,16 @@ jobs:
             local resource_name="$2"
             local action="$3"
             local address="$resource_type.$resource_name"
+            local resource_label
+
+            resource_label=$(terraform_resource_link_for_action "$action" "$resource_type" "$resource_name")
 
             # Special handling for Removed resources: price from base branch
             if [[ "$action" == "Removed" ]]; then
               local service
               service=$(resolve_service "$resource_type")
               if [[ -z "$service" ]]; then
-                record_unestimated_resource "$action" "$address" "$resource_type" "Cannot map to Azure service"
+                record_unestimated_resource "$action" "$resource_label" "$resource_type" "Cannot map to Azure service"
                 return 0
               fi
 
@@ -818,7 +858,7 @@ jobs:
               fi
 
               if [[ "$item_count" -eq 0 ]]; then
-                record_unestimated_resource "$action" "$address" "${sku_term:-$resource_type}" "No pricing data found for service '$service' (removed resource)"
+                record_unestimated_resource "$action" "$resource_label" "${sku_term:-$resource_type}" "No pricing data found for service '$service' (removed resource)"
                 return 0
               fi
 
@@ -826,7 +866,7 @@ jobs:
               selected=$(select_best_meter "$api_result" "$product_hint" "$meter_hint" "$meter_exclude" "$product_exclude" || true)
 
               if [[ -z "$selected" || "$selected" == "null" ]]; then
-                record_unestimated_resource "$action" "$address" "${sku_term:-$resource_type}" "No matching meter found for service '$service' (removed resource)"
+                record_unestimated_resource "$action" "$resource_label" "${sku_term:-$resource_type}" "No matching meter found for service '$service' (removed resource)"
                 return 0
               fi
 
@@ -837,7 +877,7 @@ jobs:
               sku_label=$(echo "$selected" | jq -r '.skuName' || true)
 
               if [[ -z "$unit_price" || "$unit_price" == "null" || "$unit_price" == "0" ]]; then
-                record_unestimated_resource "$action" "$address" "${sku_term:-$resource_type}" "Zero-priced meter returned (removed resource)"
+                record_unestimated_resource "$action" "$resource_label" "${sku_term:-$resource_type}" "Zero-priced meter returned (removed resource)"
                 return 0
               fi
 
@@ -860,7 +900,7 @@ jobs:
               # For Removed resources, show as negative (savings)
               local savings_estimate
               savings_estimate=$(awk -v amt="$monthly_amount" 'BEGIN { printf "-£%.2f", amt }')
-              append_cost_row "$action" "$address" "$savings_estimate" "$sku_label" "$notes"
+              append_cost_row "$action" "$resource_label" "$savings_estimate" "$sku_label" "$notes"
               return 0
             fi
 
@@ -868,7 +908,7 @@ jobs:
             local service
             service=$(resolve_service "$resource_type")
             if [[ -z "$service" ]]; then
-              record_unestimated_resource "$action" "$address" "$resource_type" "Cannot map to Azure service"
+              record_unestimated_resource "$action" "$resource_label" "$resource_type" "Cannot map to Azure service"
               return 0
             fi
 
@@ -901,7 +941,7 @@ jobs:
             fi
 
             if [[ "$item_count" -eq 0 ]]; then
-              record_unestimated_resource "$action" "$address" "${sku_term:-$resource_type}" "No pricing data found for service '$service'"
+              record_unestimated_resource "$action" "$resource_label" "${sku_term:-$resource_type}" "No pricing data found for service '$service'"
               return 0
             fi
 
@@ -910,7 +950,7 @@ jobs:
             selected=$(select_best_meter "$api_result" "$product_hint" "$meter_hint" "$meter_exclude" "$product_exclude" || true)
 
             if [[ -z "$selected" || "$selected" == "null" ]]; then
-              record_unestimated_resource "$action" "$address" "${sku_term:-$resource_type}" "No matching meter found for service '$service'"
+              record_unestimated_resource "$action" "$resource_label" "${sku_term:-$resource_type}" "No matching meter found for service '$service'"
               return 0
             fi
 
@@ -922,7 +962,7 @@ jobs:
             sku_label=$(echo "$selected" | jq -r '.skuName' || true)
 
             if [[ -z "$unit_price" || "$unit_price" == "null" || "$unit_price" == "0" ]]; then
-              record_unestimated_resource "$action" "$address" "${sku_term:-$resource_type}" "Zero-priced meter returned"
+              record_unestimated_resource "$action" "$resource_label" "${sku_term:-$resource_type}" "Zero-priced meter returned"
               return 0
             fi
 
@@ -976,7 +1016,7 @@ jobs:
               fi
             fi
 
-            add_estimate_with_optional_delta "$action" "$address" "$monthly_amount" "$old_monthly" "$sku_label" "$notes"
+            add_estimate_with_optional_delta "$action" "$resource_label" "$monthly_amount" "$old_monthly" "$sku_label" "$notes"
             return 0
           }
 
@@ -1186,6 +1226,19 @@ jobs:
             printf '%s' "$value"
           }
 
+          terraform_resource_link() {
+            local file_path="$1"
+            local line_number="$2"
+            local display_text="$3"
+            local repo_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+            local branch_ref="${GITHUB_HEAD_REF:-${GITHUB_SHA}}"
+
+            file_path=${file_path#./}
+            file_path=${file_path#base/}
+
+            printf '[%s](%s/blob/%s/%s#L%s)' "$display_text" "$repo_url" "$branch_ref" "$file_path" "$line_number"
+          }
+
           extract_map_keys() {
             local start_pattern="$1"
             local file_path="$2"
@@ -1304,13 +1357,14 @@ jobs:
                 RESOURCES_CHECKED=$((RESOURCES_CHECKED + 1))
                 line_num=$(echo "$line" | cut -d: -f1)
                 block_content=$(sed -n "${line_num},$((line_num + 100))p" "$file" 2>/dev/null || true)
+                resource_link=$(terraform_resource_link "$file" "$line_num" "$resource_type.$resource_name")
                 
                 if ! echo "$block_content" | grep -q "tags\s*="; then
                   MISSING_TAGS=$((MISSING_TAGS + ${#REQUIRED_TAGS[@]}))
                   for required_tag in "${REQUIRED_TAGS[@]}"; do
                     required_tag=$(trim "$required_tag")
                     [[ -z "$required_tag" ]] && continue
-                    echo "${required_tag}|${resource_type}.${resource_name}" >> /tmp/tag-missing-pairs.txt
+                    echo "${required_tag}|${resource_link}" >> /tmp/tag-missing-pairs.txt
                   done
                 else
                   defined_tags=$(collect_defined_tags "$block_content" "$file")
@@ -1327,7 +1381,7 @@ jobs:
                   if [[ ${#missing_for_resource[@]} -gt 0 ]]; then
                     MISSING_TAGS=$((MISSING_TAGS + ${#missing_for_resource[@]}))
                     for missing_tag in "${missing_for_resource[@]}"; do
-                      echo "${missing_tag}|${resource_type}.${resource_name}" >> /tmp/tag-missing-pairs.txt
+                      echo "${missing_tag}|${resource_link}" >> /tmp/tag-missing-pairs.txt
                     done
                   fi
                 fi
@@ -1379,7 +1433,7 @@ jobs:
               }
             ' /tmp/tag-missing-pairs.txt | sort | while IFS='|' read -r resource_entry tags_entry; do
               [[ -z "$resource_entry" ]] && continue
-              echo "| \`$resource_entry\` | $tags_entry |" >> /tmp/tag-validation.md
+              echo "| $resource_entry | $tags_entry |" >> /tmp/tag-validation.md
             done
           else
             echo "No missing tags detected." >> /tmp/tag-validation.md
@@ -1596,7 +1650,7 @@ jobs:
               const byAction = { Added: [], Modified: [], Removed: [] };
               for (const row of rows) {
                 if (!byAction[row.action]) continue;
-                const line = `  - \`${row.resource}\`: ${row.sku || 'N/A'}${row.estimate ? ` (${row.estimate})` : ''}.`;
+                const line = `  - ${row.resource}: ${row.sku || 'N/A'}${row.estimate ? ` (${row.estimate})` : ''}.`;
                 byAction[row.action].push(line);
               }
 

@@ -1,6 +1,5 @@
 # Reusable Terraform Cost Analysis Workflow using Azure Native Tools + GitHub Copilot
 # Uses: Azure CLI, Azure Cost Management, Azure Resource Graph, Azure Advisor
-# NO Infracost required!
 #
 # Usage in other repos:
 #   jobs:
